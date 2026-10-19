@@ -11,7 +11,7 @@ set(PICO_STACK_SIZE _u(0x1000))
 
 include(${PICO_TINYUSB_PATH}/hw/bsp/${FAMILY}/family.cmake)
 
-set(CFG_TUSB_CONFIG_FILE "include/tusb_config.h")
+set(CFG_TUSB_CONFIG_FILE "include/interfaces/tusb_config.h")
 
 
 project(SataTo3DO)
@@ -42,6 +42,24 @@ FATFs/ffunicode.c
 )
 
 pico_generate_pio_header(SataTo3DO ${CMAKE_CURRENT_LIST_DIR}/src/interfaces/read.pio)
+
+# set(PICO_STACK_SIZE ...) above is only a CMake variable and has no effect:
+# the stack sizes have to be compile definitions. Both stacks were 2KB, which
+# is too small (a 2449 bytes sector buffer, FatFs objects...).
+target_compile_definitions(SataTo3DO PRIVATE
+  PICO_STACK_SIZE=0x1000
+  PICO_CORE1_STACK_SIZE=0x1000
+)
+
+# Warnings on the project sources only
+set_source_files_properties(
+  src/main.c
+  src/interfaces/USB.c
+  src/interfaces/3DO.c
+  src/interfaces/CDROM.c
+  src/interfaces/MSC.c
+  FATFs/diskio.c
+  PROPERTIES COMPILE_OPTIONS "-Wall")
 
 # enable usb output, disable uart output
 # pico_enable_stdio_usb(SataTo3DO 1)

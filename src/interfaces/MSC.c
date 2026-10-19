@@ -5,21 +5,18 @@
 
 #include "diskio.h"
 
+#include <string.h>
+#include <stdlib.h>
+
 
 /* -------------------------------------------
 - Thanks to https://github.com/trapexit/3dt for 3do image detection and filesystem extraction
 ---------------------------------------------*/
 
-FIL curDataFile;
-char *curFilePath = NULL;
-static bool curFileMode = false;
-
-typedef enum {
-  BOOT_ISO = 1,
-  BOOT_PLAYLIST,
-} mount_mode;
-
-static mount_mode onMountMode = BOOT_ISO;
+/* -------------------------------------------
+  Everything in this file uses FatFs and/or TinyUSB, so it must only run on
+  core 0. Requests coming from the 3DO (core 1) go through runOnCore0().
+---------------------------------------------*/
 
 #define PLAYLIST_MAX 16
 typedef struct playlist_entry_s{
@@ -31,44 +28,123 @@ typedef struct playlist_entry_s{
 
 playlist_entry playlist = {0};
 
-extern uint32_t start_Block;
-extern uint32_t nb_block_Block;
-extern uint8_t *buffer_Block;
-extern bool blockRequired;
-
-extern bool read_done;
-extern fileCmd_s fileCmdRequired;
-
-extern bool subqRequired;
-extern uint8_t *buffer_subq;
-
-extern volatile bool usb_result;
-
 bool onBootIso = false;
-
-
-#define SELECTED_IMAGE 22
 
 #define TOC_NAME_LIMIT 128
 
 #if CFG_TUH_MSC
 static bool check_eject(uint8_t dev_addr);
-static void check_load(uint8_t dev_addr);
 static void check_block(uint8_t dev_addr);
-static void check_file(uint8_t dev_addr);
 static void check_subq(uint8_t dev_addr);
 #endif
 
-static bool handleBootImage(uint8_t dev_addr);
-
-static FSIZE_t last_pos = 0;
-
-static FIL file;
-
 static int current_toc = 0x00000000;
 static int current_toc_level = 0;
-// static int current_toc_index = 0xFF;
 static int current_toc_offset = 0;
+
+//--------------------------------------------------------------------+
+// Image files (one per track at most, as in multi FILE .cue sheets)
+//--------------------------------------------------------------------+
+static char *binPaths[MAX_TRACKS] = {0};
+static int nbBinFiles = 0;
+static int openBinIdx = -1;
+static FIL curBinFile;
+static FSIZE_t last_pos = 0;
+#define INVALID_POS ((FSIZE_t)-1)
+
+static void closeBinFile(void) {
+  if (openBinIdx >= 0) f_close(&curBinFile);
+  openBinIdx = -1;
+  last_pos = INVALID_POS;
+}
+
+static void clearBinFiles(void) {
+  closeBinFile();
+  for (int i = 0; i < MAX_TRACKS; i++) {
+    if (binPaths[i] != NULL) free(binPaths[i]);
+    binPaths[i] = NULL;
+  }
+  nbBinFiles = 0;
+}
+
+static bool openBinFile(int idx) {
+  if (idx == openBinIdx) return true;
+  closeBinFile();
+  if ((idx < 0) || (idx >= nbBinFiles) || (binPaths[idx] == NULL)) return false;
+  if (f_open(&curBinFile, binPaths[idx], FA_READ) != FR_OK) {
+    LOG_SATA("Can not open %s\n", binPaths[idx]);
+    return false;
+  }
+  openBinIdx = idx;
+  last_pos = 0;
+  return true;
+}
+
+// Release the menu directory context of currentImage
+static void releaseImageContext(void) {
+  if (currentImage.curDir != NULL) {
+    f_closedir(&currentImage.curDir->dir);
+    free(currentImage.curDir);
+  }
+  if (currentImage.curPath != NULL) free(currentImage.curPath);
+  currentImage.curDir = NULL;
+  currentImage.curPath = NULL;
+  current_toc_level = 0;
+  current_toc = 0x00000000;
+  current_toc_offset = 0;
+}
+
+// Forget the current image: menu context and image files
+void MSC_releaseCurrentImage(void) {
+  releaseImageContext();
+  clearBinFiles();
+  currentImage.dev_addr = 0xFF;
+  currentImage.lun = 0x0;
+}
+
+static char* duplicate(const char *s) {
+  if (s == NULL) return NULL;
+  size_t l = strlen(s) + 1;
+  char *r = malloc(l);
+  if (r != NULL) memcpy(r, s, l);
+  return r;
+}
+
+// Returns a newly allocated "dir\name" string
+static char* joinPath(const char *dir, const char *name) {
+  if ((dir == NULL) || (name == NULL)) return NULL;
+  size_t l = strlen(dir) + strlen(name) + 2;
+  char *r = malloc(l);
+  if (r != NULL) snprintf(r, l, "%s\\%s", dir, name);
+  return r;
+}
+
+// Returns a newly allocated copy of the directory part of path
+static char* dirOf(const char *path) {
+  const char *sep = strrchr(path, '\\');
+  const char *sep2 = strrchr(path, '/');
+  if ((sep == NULL) || ((sep2 != NULL) && (sep2 > sep))) sep = sep2;
+  size_t len;
+  if (sep != NULL) {
+    len = sep - path;
+  } else {
+    const char *colon = strchr(path, ':');
+    len = (colon != NULL) ? (size_t)(colon - path + 1) : 0;
+  }
+  char *r = malloc(len + 1);
+  if (r == NULL) return NULL;
+  memcpy(r, path, len);
+  r[len] = 0;
+  return r;
+}
+
+static void lbaToMsf(uint32_t lba, uint8_t *msf) {
+  lba += 150;
+  msf[0] = lba/(60*75);
+  lba %= 60*75;
+  msf[1] = lba / 75;
+  msf[2] = lba % 75;
+}
 
 int getPlaylistEntries() {
   return playlist.nb_entries;
@@ -76,14 +152,10 @@ int getPlaylistEntries() {
 
 void updatePlayListEntries() {
   if (getPlaylistEntries() != 0) {
-    if (playlist.current_entry == playlist.nb_entries) {
+    if (playlist.current_entry >= playlist.nb_entries) {
       LOG_SATA("Playlist done - clearing\n");
       clearPlaylist();
-      current_toc_level = 0;
-      current_toc = 0x00000000;
-      f_closedir(&currentImage.curDir->dir);
-      if (currentImage.curPath != NULL) free(currentImage.curPath);
-      currentImage.curPath = NULL;
+      releaseImageContext();
     }
   }
 }
@@ -95,13 +167,11 @@ bool MSC_Host_loop(device_s *dev)
     switch(dev->state) {
       case EJECTING:
         check_eject(dev->dev_addr);
+        return true;
       case MOUNTED:
-        check_load(dev->dev_addr);
-        check_file(dev->dev_addr);
         check_block(dev->dev_addr);
         check_subq(dev->dev_addr);
         return true;
-        break;
       default:
         return false;
     }
@@ -113,53 +183,8 @@ bool MSC_Host_loop(device_s *dev)
 
 #if CFG_TUH_MSC
 
-//--------------------------------------------------------------------+
-// MACRO TYPEDEF CONSTANT ENUM DECLARATION
-//--------------------------------------------------------------------+
-
-static bool startClose = true;
-
 static bool validateFile(FILINFO* fileInfo);
 static bool getNextValidToc(FILINFO *fileInfo);
-
-
-extern volatile bool is_audio;
-extern volatile bool has_subQ;
-
-#define NB_SUPPORTED_GAMES 100
-
-char* curBinPath; //same number as tracks number
-FIL curBinFile;
-
-char *curBuf = NULL;
-uint16_t curBufLength = 0;
-
-static void print_error_text(FRESULT e) {
-  switch (e) {
-    case 0:   return; //FR_OK = 0,				/* (0) Succeeded */
-    case 1:   printf("FR_DISK_ERR,			/* (1) A hard error occurred in the low level disk I/O layer */"); break;
-    case 2:   printf("FR_INT_ERR,			/* (2) Assertion failed */"); break;
-    case 3:   printf("FR_NOT_READY,		/* (3) The physical drive cannot work */"); break;
-    case 4:   printf("FR_NO_FILE,				/* (4) Could not find the file */"); break;
-    case 5:   printf("FR_NO_PATH,				/* (5) Could not find the path */"); break;
-    case 6:   printf("FR_INVALID_NAME,		/* (6) The path name format is invalid */"); break;
-    case 7:   printf("FR_DENIED,				/* (7) Access denied due to prohibited access or directory full */"); break;
-    case 8:   printf("FR_EXIST,				/* (8) Access denied due to prohibited access */"); break;
-    case 9:   printf("FR_INVALID_OBJECT,		/* (9) The file/directory object is invalid */"); break;
-    case 10:  printf("FR_WRITE_PROTECTED,		/* (10) The physical drive is write protected */"); break;
-    case 11:  printf("FR_INVALID_DRIVE,		/* (11) The logical drive number is invalid */"); break;
-    case 12:  printf("FR_NOT_ENABLED,			/* (12) The volume has no work area */"); break;
-    case 13:  printf("FR_NO_FILESYSTEM,		/* (13) There is no valid FAT volume */"); break;
-    case 14:  printf("FR_MKFS_ABORTED,		/* (14) The f_mkfs() aborted due to any problem */"); break;
-    case 15:  printf("FR_TIMEOUT,				/* (15) Could not get a grant to access the volume within defined period */"); break;
-    case 16:  printf("FR_LOCKED,				/* (16) The operation is rejected according to the file sharing policy */"); break;
-    case 17:  printf("FR_NOT_ENOUGH_CORE,		/* (17) LFN working buffer could not be allocated */"); break;
-    case 18:  printf("FR_TOO_MANY_OPEN_FILES,	/* (18) Number of open files > FF_FS_LOCK */"); break;
-    case 19:  printf("FR_INVALID_PARAMETER	/* (19) Given parameter is invalid */"); break;
-    default:  printf("Unrecognised error %d", e);
-  }
-  printf("\n");
-}
 
 static bool check_eject(uint8_t dev_addr) {
   //Execute right now
@@ -168,55 +193,38 @@ static bool check_eject(uint8_t dev_addr) {
   return true;
 }
 
-
-void requestBootImage() {
-  requestLoad = true;
-}
-
-void waitForLoad() {
-  while(requestLoad);
-}
-
-static void check_load(uint8_t dev_addr) {
-  device_s *dev = getDevice(dev_addr);
-  if (requestLoad && dev->isFatFs) {
-    //Execute right now
-    requestLoad = !handleBootImage(dev_addr);
+// Track physically holding this LBA (its pregap included)
+static int trackForLba(uint32_t lba) {
+  int t = 0;
+  for (int i = 0; i < currentImage.nb_track; i++) {
+    if (currentImage.tracks[i].start_lba <= (int32_t)lba) t = i;
   }
+  return t;
 }
-
 
 static void check_subq(uint8_t dev_addr) {
   if (currentImage.dev_addr == 0xFF) return;
   if (subqRequired && (dev_addr == currentImage.dev_addr)) {
-    bool found = false;
-    usb_cmd_on_going = true;
-    cd_s *target_track = &currentImage;
-    memset(buffer_subq, 0x0, 16);
-    uint lba = start_Block + 150;
-    buffer_subq[9] =  lba/(60*75);
-    lba %= 60*75;
-    buffer_subq[10] = lba / 75;
-    buffer_subq[11] = lba % 75;
-    lba = start_Block;
-    for (int i = 0; i<target_track->last_track; i++)
-    {
-      if (target_track->tracks[i].lba <= start_Block) {
-        buffer_subq[5] = target_track->tracks[i].CTRL_ADR;
-        buffer_subq[6] = target_track->tracks[i].id;
-        buffer_subq[7] = 1;
-        lba = start_Block - target_track->tracks[i].lba;
-        buffer_subq[13] = lba/(60*75);
-        lba %= 60*75;
-        buffer_subq[14] = lba / 75;
-        buffer_subq[15] = lba % 75;
-        found = true;
-      } else {
-        break;
-      }
-    }
-    usb_cmd_on_going = false;
+    uint8_t *buf = buffer_subq;
     subqRequired = false;
+    if ((buf != NULL) && (currentImage.nb_track > 0)) {
+      uint32_t start = start_Block;
+      track_s *t = &currentImage.tracks[trackForLba(start)];
+      memset(buf, 0x0, 16);
+      uint8_t msf[3];
+      lbaToMsf(start, msf);
+      buf[9] = msf[0];
+      buf[10] = msf[1];
+      buf[11] = msf[2];
+      uint32_t rel = (start >= t->lba) ? (start - t->lba) : 0;
+      buf[5] = t->CTRL_ADR;
+      buf[6] = t->id;
+      buf[7] = (start >= t->lba) ? 1 : 0; // index 0 in the pregap
+      buf[13] = rel/(60*75);
+      rel %= 60*75;
+      buf[14] = rel / 75;
+      buf[15] = rel % 75;
+    }
     read_done = true;
   }
 }
@@ -230,7 +238,7 @@ void printPlaylist(void) {
 
 void clearPlaylist(void) {
   LOG_SATA("Clear playlist!\n");
-  for (int i=0; i<playlist.nb_entries; i++) {
+  for (int i=0; i<PLAYLIST_MAX; i++) {
     if (playlist.path[i] != NULL) {
       free(playlist.path[i]);
       playlist.path[i] = NULL;
@@ -243,74 +251,74 @@ void clearPlaylist(void) {
 
 void addToPlaylist(int entry, bool *valid, bool *added) {
   char *entry_path = NULL;
+  *valid = false;
+  *added = false;
   LOG_SATA("Add to playlist %x\n", entry);
+  if (playlist.nb_entries >= PLAYLIST_MAX) return;
   entry_path = getPathForTOC(entry);
-  if (entry_path == NULL) {
-    *valid = false;
-    *added = false;
-    return;
-  }
+  if (entry_path == NULL) return;
   *valid = true;
-  if (playlist.nb_entries >= PLAYLIST_MAX) {
-    *valid = false;
-    *added = false;
-    return;
-  }
   *added = true;
   playlist.tocid[playlist.nb_entries] = entry;
   playlist.path[playlist.nb_entries++] = entry_path;
   LOG_SATA("Add to playlist %s %d\n", entry_path, playlist.nb_entries);
 }
 
+// Offset of the user data inside a raw sector
+static uint32_t headerSkip(const track_s *t, uint32_t out_size) {
+  if ((t->CTRL_ADR & 0x4) == 0) return 0;  // Audio: always raw
+  if (t->sector_size != 2352) return 0;    // Cooked image: nothing to skip
+  if (out_size > 2048) return 0;           // Raw read requested
+  if (t->mode == MODE_2) return 12 + 4 + 8; // Mode 2 Form 1: sync, header, subheader
+  return 12 + 4;                            // Mode 1: sync, header
+}
+
 static void check_block(uint8_t dev_addr) {
   if (currentImage.dev_addr == 0xFF) return;
-  if (blockRequired && (dev_addr == currentImage.dev_addr)) {
-    usb_cmd_on_going = true;
+  if (!(blockRequired && (dev_addr == currentImage.dev_addr))) return;
+  usb_cmd_on_going = true;
+  blockRequired = false;
 
-    cd_s *target_track = &currentImage;
-    FIL *fileOpen = &curBinFile;
-    uint read_nb = 0;
-    FSIZE_t offset = (start_Block - target_track->tracks[0].lba)*currentImage.block_size + currentImage.offset;
-    if (currentImage.block_size != currentImage.block_size_read) {
-      if (currentImage.format != 0) {
-        //Assuming a XA format has only MODE_2 and CDDA track
-        if (currentImage.block_size_read == 2048) {
-          //Mode 2 Form1
-          offset += 12 + 4 + 8; //Skip Sync, Header and subHeader
-        }
-      } else {
-        //Mode 1 or CDDA
-        if (currentImage.block_size_read == 2048) {
-          //Mode 1
-          offset += 12 + 4; //Skip Sync and Header
-        }
+  bool ok = (currentImage.nb_track > 0);
+  uint32_t out_size = currentImage.block_size_read;
+  uint8_t *buffer = buffer_Block;
+  uint32_t start = start_Block;
+  uint32_t nb = nb_block_Block;
+
+  for (uint32_t b = 0; ok && (b < nb); b++) {
+    uint32_t lba = start + b;
+    const track_s *t = &currentImage.tracks[trackForLba(lba)];
+    uint8_t *dst = &buffer[b * out_size];
+    if (((int64_t)lba < t->file_lba) || !openBinFile(t->file_idx)) {
+      ok = false;
+      break;
+    }
+    uint32_t skip = headerSkip(t, out_size);
+    FSIZE_t pos = (FSIZE_t)((int64_t)lba - t->file_lba) * t->sector_size + skip;
+    UINT copy = t->sector_size - skip;
+    if (copy > out_size) copy = out_size;
+    if (last_pos != pos) {
+      if (f_lseek(&curBinFile, pos) != FR_OK) {
+        LOG_SATA("Can not seek %s\n", binPaths[t->file_idx]);
+        last_pos = INVALID_POS;
+        ok = false;
+        break;
       }
     }
-    if (last_pos != offset)
-      if (f_lseek(fileOpen, offset) != FR_OK) LOG_SATA("Can not seek %s\n", curBinPath);
-    last_pos = offset;
-    if (is_audio) {
-      if (has_subQ) {
-        //Work only for 1 block here
-        FSIZE_t data_offset = 0;
-
-          if (f_read(fileOpen, &buffer_Block[data_offset], currentImage.block_size, &read_nb) != FR_OK) LOG_SATA("Can not read %s\n", curBinPath);
-          data_offset += read_nb;
-          for (int i = currentImage.block_size; i < currentImage.block_size_read; i++) {
-            buffer_Block[data_offset++] = 0;
-          }
-      } else {
-        if (f_read(fileOpen, &buffer_Block[0], currentImage.block_size_read, &read_nb) != FR_OK) LOG_SATA("Can not read %s\n", curBinPath);
-      }
-    } else {
-      if (f_read(fileOpen, buffer_Block, nb_block_Block*currentImage.block_size_read, &read_nb) != FR_OK) LOG_SATA("Can not read %s\n", curBinPath);
-      if (read_nb != nb_block_Block*currentImage.block_size_read) LOG_SATA("Bad read %d %d\n", read_nb, nb_block_Block*currentImage.block_size_read);
-      last_pos += read_nb;
+    UINT read_nb = 0;
+    if (f_read(&curBinFile, dst, copy, &read_nb) != FR_OK) {
+      LOG_SATA("Can not read %s\n", binPaths[t->file_idx]);
+      last_pos = INVALID_POS;
+      ok = false;
+      break;
     }
-    usb_cmd_on_going = false;
-    blockRequired = false;
-    read_done = true;
+    last_pos = pos + read_nb;
+    // Missing bytes (subcode, C2 or end of file) are reported as 0
+    if (read_nb < out_size) memset(&dst[read_nb], 0, out_size - read_nb);
   }
+  if (!ok) set3doDriveError();
+  usb_cmd_on_going = false;
+  read_done = true;
 }
 
 static bool is_3do_iso(uint8_t* buf) {
@@ -340,370 +348,261 @@ static bool is_mode1_2352(uint8_t* buf) {
   return is_3do_iso(&buf[0x10]);
 }
 
-static bool isA3doImage(char * path) {
-  FIL myFile;
-  FRESULT fr;
+static FIL probeFile; // static: keeps the large FIL object off the small stack
+
+static bool isA3doImage(const char * path) {
   uint8_t buf[0x20];
-  uint read_nb = 0;
+  UINT read_nb = 0;
   bool ret = false;
-  fr = f_open(&myFile, path, FA_READ);
-  if (fr){
+  if (path == NULL) return false;
+  if (f_open(&probeFile, path, FA_READ) != FR_OK) {
     return false;
   }
 
-  if (f_read(&myFile, &buf, 0x20, &read_nb) != FR_OK) {
-    f_close(&myFile);
-    return false;
+  if ((f_read(&probeFile, &buf, 0x20, &read_nb) == FR_OK) && (read_nb == 0x20)) {
+    ret = ((is_mode1_2352(&buf[0])) || (is_3do_iso(&buf[0])));
   }
-  if (read_nb != 0x20)  {
-    f_close(&myFile);
-    return false;
-  }
-
-  ret = ((is_mode1_2352(&buf[0])) || (is_3do_iso(&buf[0])));
-  f_close(&myFile);
+  f_close(&probeFile);
   return ret;
 }
 
-static bool LoadfromCue(char *filePath) {
-  if (currentImage.dev_addr == 0xFF) return;
-  FIL myFile;
-  FRESULT fr;
-  bool  valid = false;
-  char line[100];
-  unsigned int track_num = 0;
+//--------------------------------------------------------------------+
+// CUE sheet parsing
+//--------------------------------------------------------------------+
+static FIL cueFile;
+static char cueLine[256];
+static char cueKey[16];
+static char cueRest[240];
+static char cueName[240];
+static track_s cueTracks[MAX_TRACKS];
+static char *cueFiles[MAX_TRACKS];
+
+static void freeCueFiles(int nb) {
+  for (int i = 0; i < nb; i++) {
+    if (cueFiles[i] != NULL) free(cueFiles[i]);
+    cueFiles[i] = NULL;
+  }
+}
+
+// Parse a cue sheet. When load is true and the sheet is valid, currentImage
+// and the image file list are updated. Supports one or several FILE entries.
+static bool parseCue(const char *cuePath, bool load) {
+  bool valid = true;
+  int nbTracks = 0;
+  int nbFiles = 0;
+  FSIZE_t fileSize = 0;
+  uint16_t fileSectorSize = 0;
+  uint32_t fileStartLba = 0; // position of the current FILE, in sectors from the first FILE
+  bool hasIndex1[MAX_TRACKS] = {0};
+
+  if (f_open(&cueFile, cuePath, FA_READ) != FR_OK) {
+    LOG_SATA("can not open %s for reading\n", cuePath);
+    return false;
+  }
+  char *dir = dirOf(cuePath);
+  if (dir == NULL) {
+    f_close(&cueFile);
+    return false;
+  }
+  memset(cueTracks, 0, sizeof(cueTracks));
+  memset(cueFiles, 0, sizeof(cueFiles));
+
+  while (valid && f_gets(cueLine, sizeof(cueLine), &cueFile)) {
+    cueRest[0] = 0;
+    char *line = cueLine;
+    // Skip an UTF-8 byte order mark
+    if (((uint8_t)line[0] == 0xEF) && ((uint8_t)line[1] == 0xBB) && ((uint8_t)line[2] == 0xBF)) line += 3;
+    int n = sscanf(line, " %15s %239[^\r\n]", cueKey, cueRest);
+    if (n < 1) continue; // empty line
+
+    if (strcmp(cueKey, "FILE") == 0) {
+      if ((n < 2) || (nbFiles >= MAX_TRACKS)) { valid = false; break; }
+      if ((sscanf(cueRest, " \"%239[^\"]\"", cueName) != 1) &&
+          (sscanf(cueRest, " %239s", cueName) != 1)) { valid = false; break; }
+      // The previous file ends where this one starts
+      if (nbFiles > 0) {
+        if (fileSectorSize == 0) { valid = false; break; } // FILE without TRACK
+        fileStartLba += fileSize / fileSectorSize;
+      }
+      char *path = joinPath(dir, cueName);
+      FILINFO binInfo;
+      if ((path == NULL) || (f_stat(path, &binInfo) != FR_OK) || (binInfo.fattrib & AM_DIR)) {
+        if (path != NULL) free(path);
+        valid = false;
+        break; //Bin file does not exist or is not a file
+      }
+      cueFiles[nbFiles++] = path;
+      fileSize = binInfo.fsize;
+      fileSectorSize = 0;
+      continue;
+    }
+
+    if (strcmp(cueKey, "TRACK") == 0) {
+      unsigned int track_num = 0;
+      char type[16];
+      if ((nbFiles == 0) || (nbTracks >= MAX_TRACKS) ||
+          (sscanf(cueRest, " %u %15s", &track_num, type) != 2) ||
+          (track_num < 1) || (track_num > MAX_TRACKS)) {
+        valid = false;
+        break;
+      }
+      track_s *t = &cueTracks[nbTracks];
+      uint16_t size = 2352;
+      char *slash = strchr(type, '/');
+      if (slash != NULL) size = atoi(slash + 1);
+      if (strncmp(type, "MODE1", 5) == 0) {
+        t->CTRL_ADR = 0x4;
+        t->mode = MODE_1;
+      } else if (strncmp(type, "MODE2", 5) == 0) {
+        //PhotoCD cue file
+        t->CTRL_ADR = 0x4;
+        t->mode = MODE_2;
+      } else if (strncmp(type, "AUDIO", 5) == 0) {
+        t->CTRL_ADR = 0x0;
+        t->mode = CDDA;
+        size = 2352;
+      } else {
+        valid = false;
+        break;
+      }
+      if ((size != 2048) && (size != 2352)) { valid = false; break; }
+      // All the tracks of one file share the same sector size
+      if ((fileSectorSize != 0) && (fileSectorSize != size)) { valid = false; break; }
+      fileSectorSize = size;
+      t->id = track_num;
+      t->sector_size = size;
+      t->file_idx = nbFiles - 1;
+      t->file_lba = fileStartLba;
+      t->start_lba = INT32_MAX; // set by INDEX 00 or INDEX 01
+      // The first track has to be a 3DO volume (except for Photo-CD)
+      if ((nbTracks == 0) && (t->mode == MODE_1) && !isA3doImage(cueFiles[nbFiles - 1])) {
+        valid = false;
+        break;
+      }
+      nbTracks++;
+      continue;
+    }
+
+    if (strcmp(cueKey, "INDEX") == 0) {
+      unsigned int indexnum, min, sec, frame;
+      if ((nbTracks == 0) || (sscanf(cueRest, " %u %u:%u:%u", &indexnum, &min, &sec, &frame) != 4) ||
+          (sec >= 60) || (frame >= 75)) {
+        valid = false;
+        break;
+      }
+      track_s *t = &cueTracks[nbTracks - 1];
+      // INDEX positions are relative to the start of the current FILE
+      uint32_t pos = fileStartLba + (min*60 + sec)*75 + frame;
+      if (indexnum == 0) {
+        t->start_lba = pos;
+      } else if (indexnum == 1) {
+        t->lba = pos;
+        if (t->start_lba == INT32_MAX) t->start_lba = pos;
+        hasIndex1[nbTracks - 1] = true;
+      }
+      continue;
+    }
+    // Other commands (REM, PREGAP, POSTGAP, FLAGS...) are ignored
+  }
+  f_close(&cueFile);
+  free(dir);
+
+  if (valid && (nbTracks == 0)) valid = false;
+  for (int i = 0; valid && (i < nbTracks); i++) {
+    if (!hasIndex1[i]) valid = false;
+  }
+  if (!valid || !load) {
+    freeCueFiles(nbFiles);
+    return valid;
+  }
+
+  // The INDEX 01 of the first track is the LBA 0 of the disc: what is before
+  // it in the file is the pregap of the first track (negative LBAs).
+  uint32_t base = cueTracks[0].lba;
+  for (int i = 0; i < nbTracks; i++) {
+    cueTracks[i].lba -= base;
+    cueTracks[i].start_lba -= (int32_t)base;
+    cueTracks[i].file_lba -= (int32_t)base;
+    lbaToMsf(cueTracks[i].lba, cueTracks[i].msf);
+  }
+
+  // Valid sheet: install it as the current image
+  clearBinFiles();
+  for (int i = 0; i < nbFiles; i++) {
+    binPaths[i] = cueFiles[i];
+    cueFiles[i] = NULL;
+  }
+  nbBinFiles = nbFiles;
+  memcpy(currentImage.tracks, cueTracks, sizeof(track_s) * nbTracks);
+  currentImage.nb_track = nbTracks;
+  currentImage.first_track = cueTracks[0].id;
+  currentImage.last_track = cueTracks[nbTracks - 1].id;
+  currentImage.hasOnlyAudio = true;
+  currentImage.format = 0x0;
+  currentImage.multiSession = false;
+  currentImage.offset = 0;
+  for (int i = 0; i < nbTracks; i++) {
+    if (cueTracks[i].CTRL_ADR & 0x4) currentImage.hasOnlyAudio = false;
+    if (cueTracks[i].mode == MODE_2) currentImage.format = 0x20; //XA format
+  }
+  // Size of the main data sector of the image
+  currentImage.block_size = cueTracks[0].sector_size;
+  currentImage.block_size_read = (cueTracks[0].CTRL_ADR & 0x4) ? 2048 : 2352;
+  currentImage.nb_block = fileStartLba + fileSize / fileSectorSize - base;
+  lbaToMsf(currentImage.nb_block, currentImage.msf);
+  return true;
+}
+
+static bool LoadfromCue(const char *filePath) {
+  if (currentImage.dev_addr == 0xFF) return false;
   LOG_SATA("Load From Cue %s\n", filePath);
-  fr = f_open(&myFile, filePath, FA_READ);
-  if (fr){
-     LOG_SATA("can not open %s for reading\n",filePath);
-     return false;
-  }
-
-  // Time to generate TOC
-  for (;;)
-  {
-    currentImage.nb_track = 0;
-    /* Read every line and display it */
-    while (f_gets(line, sizeof line, &myFile)) {
-      valid = true;
-      char line_end[100];
-      char line_start[100];
-      if (sscanf(line, " %s %[^\r\n]\r\n", line_start, line_end) != EOF) {
-        if (strncmp(line_start, "FILE", 4) == 0) {
-          FILINFO binInfo;
-          char filename[100];
-          char *lastDir = rindex(filePath, '\\');
-          char * testPath;
-          char *newPath = malloc(lastDir - filePath + 1);
-          memcpy(newPath, filePath, lastDir - filePath);
-          newPath[lastDir-filePath] = 0;
-
-          sscanf(line_end, " \"%[^\"]\"", filename);
-          testPath = malloc(strlen(newPath)+strlen(filename)+2);
-          sprintf(&testPath[0], "%s\\%s", newPath, filename);
-          free(newPath);
-          if (curBinPath != NULL) free(curBinPath);
-          curBinPath = testPath;
-          fr = f_stat(curBinPath, &binInfo);
-          if (fr == FR_NO_FILE) {
-            free(curBinPath);
-            curBinPath = NULL;
-            valid = false;
-            break; //Bin file does not exists
-          }
-          if (binInfo.fattrib & AM_DIR) {
-            free(curBinPath);
-            curBinPath = NULL;
-            valid = false;
-            break; //not a file
-          }
-          currentImage.nb_block = binInfo.fsize;
-          continue;
-        }
-        if (strncmp(line_start, "TRACK", 5) == 0) {
-          unsigned int sector_size = 0;
-          unsigned int ctl_addr = 0;
-          if (sscanf(line_end, " %u %[^\r\n]\r\n", &track_num, line_end) != EOF)
-          {
-            if (strncmp(line_end, "MODE1", 5) == 0)
-            {
-              // Figure out the track sector size
-              if (!isA3doImage(curBinPath)) {
-                valid = false;
-                break;
-              }
-              currentImage.block_size =  atoi(line_end + 6);
-              currentImage.block_size_read = 2048;
-              currentImage.tracks[track_num - 1].CTRL_ADR = 0x4;
-              currentImage.tracks[track_num - 1].id = track_num;
-              currentImage.tracks[track_num - 1].mode = MODE_1;
-            }
-            else if (strncmp(line_end, "MODE2", 5) == 0)
-            {
-              //PhotoCD cue file
-              // Figure out the track sector size
-              currentImage.block_size = currentImage.block_size_read = atoi(line_end + 6);
-              currentImage.block_size_read = 2048;
-              currentImage.tracks[track_num - 1].CTRL_ADR = 0x4;
-              currentImage.tracks[track_num - 1].id = track_num;
-              currentImage.tracks[track_num - 1].mode = MODE_2;
-            }
-            else if (strncmp(line_end, "AUDIO", 5) == 0)
-            {
-              // // Update toc entry
-              currentImage.block_size = 2352; //(98 * (24))
-              currentImage.block_size_read = 2352; // 98*24
-              currentImage.tracks[track_num - 1].CTRL_ADR = 0x0;
-              currentImage.tracks[track_num - 1].id = track_num;
-              currentImage.tracks[track_num - 1].mode = CDDA;
-            }
-            else {
-              valid = false;
-              break;
-            }
-            currentImage.nb_track++;
-          } else {
-            valid = false;
-            break;
-          }
-          continue;
-        }
-        else if (strncmp(line_start, "INDEX", 5) == 0)
-        {
-          unsigned int indexnum, min, sec, frame;
-           if (sscanf(line_end, " %u %u:%u:%u\r\n", &indexnum, &min, &sec, &frame) == EOF) {
-             valid = false;
-             break;
-           }
-
-           if (indexnum == 1)
-           {
-              currentImage.tracks[track_num - 1].msf[0] = min;
-              currentImage.tracks[track_num - 1].msf[1] = sec + 2;
-              currentImage.tracks[track_num - 1].msf[2] = frame;
-              currentImage.tracks[track_num - 1].lba = min*60*75+sec*75+frame;
-           }
-        }
-#ifdef USE_PRE_POST_GAP
-        else if (strncmp(line_start, "PREGAP", 6) == 0)
-        {
-           if (sscanf(line_end, " %d:%d:%d\r\n", &min, &sec, &frame) == EOF)
-              break;
-
-           // pregap += MSF_TO_FAD(min, sec, frame);
-        }
-        else if (strncmp(line_start, "POSTGAP", 7) == 0)
-        {
-           if (sscanf(line_end, " %d:%d:%d\r\n", &min, &sec, &frame) == EOF)
-              break;
-        }
-#endif
-      }
-    }
-    /* Close the file */
-    f_close(&myFile);
-    break;
-  }
-  if (valid) {
-    currentImage.first_track = 1;
-    currentImage.last_track = currentImage.nb_track;
-    currentImage.hasOnlyAudio = true;
-    currentImage.format = 0x0;
-    for (int i = 0; i<currentImage.last_track; i++)
-    {
-      if (currentImage.tracks[i].CTRL_ADR & 0x4) {
-        currentImage.hasOnlyAudio = false;
-      }
-      if (currentImage.tracks[i].mode == MODE_2){
-        currentImage.format = 0x20; //XA format
-      }
-    }
-    currentImage.nb_block /= currentImage.block_size;
-    int lba = currentImage.nb_block + 150;
-    currentImage.msf[0] = lba/(60*75);
-    lba %= 60*75;
-    currentImage.msf[1] = lba / 75;
-    currentImage.msf[2] = lba % 75;
-  }
-  return valid;
+  return parseCue(filePath, true);
 }
 
 static bool ValidateInfofromCue(FILINFO *fileInfo) {
-  if (currentImage.dev_addr == 0xFF) return;
-  FIL myFile;
-  UINT i = strlen(fileInfo->fname);
-  FRESULT fr;
-  bool  valid = false;
-  char line[100];
-  unsigned int track_num = 0;
-  char *newPath = malloc(strlen(currentImage.curPath)+i+2);
-  sprintf(&newPath[0], "%s\\%s", currentImage.curPath, fileInfo->fname);
-  fr = f_open(&myFile, newPath, FA_READ);
-  if (fr){
-     LOG_SATA("can not open %s for reading\n",newPath);
-     return false;
-  }
-
+  if ((currentImage.dev_addr == 0xFF) || (currentImage.curPath == NULL)) return false;
+  char *newPath = joinPath(currentImage.curPath, fileInfo->fname);
+  if (newPath == NULL) return false;
   LOG_SATA("Validate Game %s\n", newPath);
-  // Time to generate TOC
-  for (;;)
-  {
-    /* Read every line and display it */
-    while (f_gets(line, sizeof line, &myFile)) {
-      valid = true;
-      char line_end[100];
-      char line_start[100];
-      if (sscanf(line, " %s %[^\r\n]\r\n", line_start, line_end) != EOF) {
-        if (strncmp(line_start, "FILE", 4) == 0) {
-          FILINFO binInfo;
-          char filename[100];
-          char * testPath;
-          sscanf(line_end, " \"%[^\"]\"", filename);
-          testPath = malloc(strlen(currentImage.curPath)+strlen(filename)+2);
-          sprintf(&testPath[0], "%s\\%s", currentImage.curPath, filename);
-          fr = f_stat(testPath, &binInfo);
-          free(testPath);
-          if (fr == FR_NO_FILE) {
-            valid = false;
-            break; //Bin file does not exists
-          }
-          if (binInfo.fattrib & AM_DIR) {
-            valid = false;
-            break; //not a file
-          }
-          // currentImage.nb_block = binInfo.fsize;
-          continue;
-        }
-        if (strncmp(line_start, "TRACK", 5) == 0) {
-          unsigned int sector_size = 0;
-          unsigned int ctl_addr = 0;
-          if (sscanf(line_end, " %u %[^\r\n]\r\n", &track_num, line_end) != EOF)
-          {
-            if (strncmp(line_end, "MODE1", 5) == 0)
-            {
-              // Figure out the track sector size
-              if (!isA3doImage(curBinPath)) {
-                valid = false;
-                break;
-              }
-              // currentImage.block_size =  atoi(line_end + 6);
-              // currentImage.block_size_read = 2048;
-              // currentImage.tracks[track_num - 1].CTRL_ADR = 0x4;
-              // currentImage.tracks[track_num - 1].id = track_num;
-              // currentImage.tracks[track_num - 1].mode = MODE_1;
-            }
-            else if (strncmp(line_end, "MODE2", 5) == 0)
-            {
-              //PhotoCD cue file
-              // Figure out the track sector size
-              // currentImage.block_size = currentImage.block_size_read = atoi(line_end + 6);
-              // currentImage.block_size_read = 2048;
-              // currentImage.tracks[track_num - 1].CTRL_ADR = 0x4;
-              // currentImage.tracks[track_num - 1].id = track_num;
-              // currentImage.tracks[track_num - 1].mode = MODE_2;
-            }
-            else if (strncmp(line_end, "AUDIO", 5) == 0)
-            {
-              // // Update toc entry
-              // currentImage.block_size = 2352; //(98 * (24))
-              // currentImage.block_size_read = 2352; // 98*24
-              // currentImage.tracks[track_num - 1].CTRL_ADR = 0x0;
-              // currentImage.tracks[track_num - 1].id = track_num;
-              // currentImage.tracks[track_num - 1].mode = CDDA;
-            }
-            else {
-              valid = false;
-              break;
-            }
-            // currentImage.nb_track++;
-          } else {
-            valid = false;
-            break;
-          }
-          continue;
-        }
-        else if (strncmp(line_start, "INDEX", 5) == 0)
-        {
-          unsigned int indexnum, min, sec, frame;
-           if (sscanf(line_end, " %u %u:%u:%u\r\n", &indexnum, &min, &sec, &frame) == EOF) {
-             valid = false;
-             break;
-           }
-
-           // if (indexnum == 1)
-           // {
-           //    currentImage.tracks[track_num - 1].msf[0] = min;
-           //    currentImage.tracks[track_num - 1].msf[1] = sec + 2;
-           //    currentImage.tracks[track_num - 1].msf[2] = frame;
-           //    currentImage.tracks[track_num - 1].lba = min*60*75+sec*75+frame;
-           // }
-        }
-#ifdef USE_PRE_POST_GAP
-        else if (strncmp(line_start, "PREGAP", 6) == 0)
-        {
-           if (sscanf(line_end, " %d:%d:%d\r\n", &min, &sec, &frame) == EOF)
-              break;
-
-           // pregap += MSF_TO_FAD(min, sec, frame);
-        }
-        else if (strncmp(line_start, "POSTGAP", 7) == 0)
-        {
-           if (sscanf(line_end, " %d:%d:%d\r\n", &min, &sec, &frame) == EOF)
-              break;
-        }
-#endif
-      }
-    }
-    /* Close the file */
-    f_close(&myFile);
-    break;
-  }
+  bool valid = parseCue(newPath, false);
+  free(newPath);
   return valid;
 }
 
 static bool ValidateInfofromIso(FILINFO *fileInfo) {
-  if (currentImage.dev_addr == 0xFF) return;
-  FIL myFile;
-  UINT i = strlen(fileInfo->fname);
-  FRESULT fr;
-  char *newPath = malloc(strlen(currentImage.curPath)+i+2);
-  sprintf(&newPath[0], "%s\\%s", currentImage.curPath, fileInfo->fname);
-  if (!isA3doImage(newPath)) {
-    return false;
-  }
-
-  return true;
+  if ((currentImage.dev_addr == 0xFF) || (currentImage.curPath == NULL)) return false;
+  char *newPath = joinPath(currentImage.curPath, fileInfo->fname);
+  if (newPath == NULL) return false;
+  bool ret = isA3doImage(newPath);
+  free(newPath);
+  return ret;
 }
 
-static bool LoadfromIso(char *filePath) {
-  if (currentImage.dev_addr == 0xFF) return false;
-  FIL myFile;
-  FILINFO fileInfo;
-  FRESULT fr;
-  if (!isA3doImage(filePath)) {
-    return false;
-  }
-  fr = f_stat(filePath, &fileInfo);
-  if ((fileInfo.fsize % 2352)==0) {
-    currentImage.block_size = 2352;
-    currentImage.offset = 16;
-  } else if ((fileInfo.fsize % 2048)==0) {
-    currentImage.block_size = 2048;
-    currentImage.offset = 0;
+// Install a single track ISO image as currentImage. Takes ownership of path.
+static bool setupIsoImage(char *path, FSIZE_t fsize) {
+  uint16_t sector_size;
+  if ((fsize % 2352)==0) {
+    sector_size = 2352;
+  } else if ((fsize % 2048)==0) {
+    sector_size = 2048;
   } else {
     //Bad format
-    LOG_SATA("File is %d bytes length\n", fileInfo.fsize);
+    LOG_SATA("File is %lu bytes length\n", (unsigned long)fsize);
+    free(path);
     return false;
   }
+  clearBinFiles();
+  binPaths[0] = path;
+  nbBinFiles = 1;
 
-  LOG_SATA("Load Game %s\n", filePath);
+  // The data sent to the 3DO is always the 2048 bytes of user data by default,
+  // the sync/header of raw 2352 images is skipped by check_block.
+  currentImage.block_size = sector_size;
+  currentImage.block_size_read = 2048;
+  currentImage.offset = 0;
+  currentImage.multiSession = false;
 
-  if (curBinPath != NULL) free(curBinPath);
-  curBinPath = filePath;
-
-  currentImage.block_size_read = currentImage.block_size;
-
-  currentImage.nb_block = fileInfo.fsize / currentImage.block_size;
+  currentImage.nb_block = fsize / sector_size;
 
   currentImage.first_track = 1;
   currentImage.last_track = 1;
@@ -711,85 +610,60 @@ static bool LoadfromIso(char *filePath) {
   currentImage.hasOnlyAudio = false;
   currentImage.format = 0x0; //MODE1 always
 
+  memset(&currentImage.tracks[0], 0, sizeof(track_s));
   currentImage.tracks[0].CTRL_ADR = 0x4;
-
   currentImage.tracks[0].msf[0] = 0;
   currentImage.tracks[0].msf[1] = 2;
   currentImage.tracks[0].msf[2] = 0;
   currentImage.tracks[0].lba = 0;
   currentImage.tracks[0].mode = MODE_1;
   currentImage.tracks[0].id = 1;
+  currentImage.tracks[0].sector_size = sector_size;
+  currentImage.tracks[0].file_idx = 0;
+  currentImage.tracks[0].file_lba = 0;
+  currentImage.tracks[0].start_lba = 0;
 
-  int lba = currentImage.nb_block + 150;
-  currentImage.msf[0] = lba/(60*75);
-  lba %= 60*75;
-  currentImage.msf[1] = lba / 75;
-  currentImage.msf[2] = lba % 75;
-
+  lbaToMsf(currentImage.nb_block, currentImage.msf);
   return true;
 }
 
+static bool LoadfromIso(const char *filePath) {
+  if (currentImage.dev_addr == 0xFF) return false;
+  FILINFO fileInfo;
+  if (!isA3doImage(filePath)) {
+    return false;
+  }
+  if (f_stat(filePath, &fileInfo) != FR_OK) return false;
 
+  LOG_SATA("Load Game %s\n", filePath);
+  // The playlist keeps its own copy of the path
+  char *path = duplicate(filePath);
+  if (path == NULL) return false;
+  return setupIsoImage(path, fileInfo.fsize);
+}
+
+
+// On success currentImage takes ownership of curPath
 static bool extractBootImage(FILINFO *fileInfo, char* curPath, uint8_t dev_addr) {
-  if (currentImage.dev_addr != 0xFF) return;
-  FIL myFile;
-  UINT i = strlen(fileInfo->fname);
-  FRESULT fr;
-  char *newPath = malloc(strlen(curPath)+i+2);
-  sprintf(&newPath[0], "%s\\%s", curPath, fileInfo->fname);
+  if (currentImage.dev_addr != 0xFF) return false;
+  device_s *dev = getDevice(dev_addr);
+  if (dev == NULL) return false;
+  char *newPath = joinPath(curPath, fileInfo->fname);
+  if (newPath == NULL) return false;
   if (!isA3doImage(newPath)) {
     LOG_SATA("Is not a 3DO image %s\n", curPath);
     free(newPath);
     return false;
   }
-  if (((fileInfo->fsize % 2352)!=0) && ((fileInfo->fsize % 2048)!=0)){
-    LOG_SATA("File is %d bytes length\n", fileInfo->fsize);
-    free(newPath);
+  if (!setupIsoImage(newPath, fileInfo->fsize)) {
     return false;
   }
-  if ((fileInfo->fsize % 2352)==0) {
-    currentImage.block_size = 2352;
-    currentImage.offset = 16;
-  } else if ((fileInfo->fsize % 2048)==0) {
-    currentImage.block_size = 2048;
-    currentImage.offset = 0;
-  }
 
-  if (curBinPath != NULL) free(curBinPath);
-
-  device_s *dev = getDevice(dev_addr);
   currentImage.dev_addr = dev->dev_addr;
   currentImage.lun = dev->lun;
 
-  if (currentImage.curPath != NULL) free(currentImage.curPath);
+  if ((currentImage.curPath != NULL) && (currentImage.curPath != curPath)) free(currentImage.curPath);
   currentImage.curPath = curPath;
-
-  curBinPath = newPath;
-
-  currentImage.block_size_read = currentImage.block_size;
-
-  currentImage.nb_block = fileInfo->fsize / currentImage.block_size;
-
-  currentImage.first_track = 1;
-  currentImage.last_track = 1;
-  currentImage.nb_track = 1;
-  currentImage.hasOnlyAudio = false;
-  currentImage.format = 0x0; //MODE1 always
-
-  currentImage.tracks[0].CTRL_ADR = 0x4;
-
-  currentImage.tracks[0].msf[0] = 0;
-  currentImage.tracks[0].msf[1] = 2;
-  currentImage.tracks[0].msf[2] = 0;
-  currentImage.tracks[0].lba = 0;
-  currentImage.tracks[0].mode = MODE_1;
-  currentImage.tracks[0].id = 1;
-
-  int lba = currentImage.nb_block + 150;
-  currentImage.msf[0] = lba/(60*75);
-  lba %= 60*75;
-  currentImage.msf[1] = lba / 75;
-  currentImage.msf[2] = lba % 75;
   return true;
 }
 
@@ -803,7 +677,7 @@ static bool validateFile(FILINFO* fileInfo) {
   return false;
 }
 
-static bool loadFile(char* filepath) {
+static bool loadFile(const char* filepath) {
   if (f_path_contains(filepath,"*.cue")){
      return LoadfromCue(filepath);
   }
@@ -815,137 +689,114 @@ static bool loadFile(char* filepath) {
 
 static dir_t* getNewDir(void) {
   dir_t * ret=(dir_t*)malloc(sizeof(dir_t));
+  if (ret != NULL) memset(ret, 0, sizeof(dir_t));
   return ret;
 }
 
-#define MAX_LEVEL 3
-int level = -1;
-static bool buildDir(dir_t *dirInfo, char *path) {
-  FILINFO fileInfo;
-  bool ended = false;
-  bool hasGame = false;
-  level++;
-  LOG_SATA("Explore %s (%d)\n", path, level);
-  FRESULT res = f_findfirst(&dirInfo->dir, &fileInfo, path, "*");
-  do {
-    ended = (strlen(fileInfo.fname) == 0) || (level >= 2) || (res != FR_OK);
-    if (!ended) {
-      bool isDir = (fileInfo.fattrib & AM_DIR);
-      if (isDir && !(fileInfo.fname[0] == '.' || fileInfo.fattrib & (AM_HID | AM_SYS))) {  // skip hidden or system files
-        FRESULT res;
-        dir_t* new_dir = getNewDir();
-        UINT i = strlen(fileInfo.fname);
-        char *newPath = malloc(strlen(path)+i+2);
-        sprintf(&newPath[0], "%s\\%s", path, fileInfo.fname);
-        res = f_opendir(&(new_dir->dir), newPath);
-        hasGame |= buildDir(new_dir, newPath);
-
-        f_closedir(&(new_dir->dir));
-      } else {
-        hasGame |= f_path_contains(fileInfo.fname,"*.cue"); //Verifier le parsing et le cue
-        // hasGame |= f_path_contains(fileInfo.fname,"*.bin"); //Verifier le parsing et le cue
-        hasGame |= f_path_contains(fileInfo.fname,"*.iso"); //Verifier le parsing et le cue
-      }
-      res = f_findnext(&dirInfo->dir, &fileInfo);
-    }
-  } while(!ended);
-  level--;
-  return hasGame;
+// Device address from a FatFs path ("N:..." is the device N+1)
+static uint8_t devAddrFromPath(const char *path) {
+  if ((path == NULL) || (path[0] < '0') || (path[0] > '9')) return 0xFF;
+  return (uint8_t)(atoi(path) + 1);
 }
 
-bool loadPlaylistEntry(uint8_t dev_addr) {
+static bool loadPlaylistEntry(uint8_t dev_addr) {
+  (void) dev_addr;
   bool ret = false;
-  bool loaded = false;
-  FRESULT res;
-  FILINFO fileInfo;
-  LOG_SATA("try to load (%x) %d %s\n", playlist.tocid[playlist.current_entry], playlist.current_entry, playlist.path[playlist.current_entry]);
-  device_s *new_dev = getDevice(playlist.tocid[playlist.current_entry]>>24);
-  if (getTocEntry(playlist.tocid[playlist.current_entry]) == 0x0) {
-    //Entry detected as device
+  int entry = playlist.tocid[playlist.current_entry];
+  char *path = playlist.path[playlist.current_entry];
+  LOG_SATA("try to load (%x) %d %s\n", entry, playlist.current_entry, path);
+  if (getTocEntry(entry) == 0x0) {
+    //Entry detected as device (a CD drive)
     LOG_SATA("Detected an entry\n");
-    device_s *dev = getDevice(dev_addr);
-    memcpy(&currentImage, &new_dev->rawImage, sizeof(cd_s));
-    new_dev->state = MOUNTED;
-    usb_cmd_on_going = false;
-    set3doCDReady(new_dev->dev_addr, true);
-    set3doDriveMounted(new_dev->dev_addr, true);
-    loaded = true;
-    ret = true;
+    device_s *new_dev = getDevice(entry>>24);
+    if ((new_dev != NULL) && (new_dev->type == CD_TYPE) && (new_dev->rawImage.nb_track > 0)) {
+      releaseImageContext();
+      clearBinFiles();
+      memcpy(&currentImage, &new_dev->rawImage, sizeof(cd_s));
+      currentImage.curDir = NULL;
+      currentImage.curPath = NULL;
+      new_dev->state = MOUNTED;
+      usb_cmd_on_going = false;
+      set3doCDReady(new_dev->dev_addr, true);
+      set3doDriveMounted(new_dev->dev_addr, true);
+      ret = true;
+    } else {
+      LOG_SATA("CD drive is not available anymore\n");
+    }
   } else {
     LOG_SATA("Try to load\n");
-    currentImage.dev_addr = new_dev->dev_addr;
-    currentImage.lun = new_dev->lun;
-    if (loadFile(playlist.path[playlist.current_entry])) {
-      LOG_SATA("Load entry %d\n",playlist.current_entry);
-      loaded = true;
-      if (f_open(&curBinFile, curBinPath, FA_READ) == FR_OK) {
-        device_s *dev = getDevice(dev_addr);
-        LOG_SATA("Game loaded\n");
-        last_pos = 0;
-        dev->state = MOUNTED;
+    device_s *new_dev = getDevice(devAddrFromPath(path));
+    if (new_dev != NULL) {
+      currentImage.dev_addr = new_dev->dev_addr;
+      currentImage.lun = new_dev->lun;
+      if (loadFile(path) && openBinFile(0)) {
+        LOG_SATA("Game loaded %d\n",playlist.current_entry);
+        new_dev->state = MOUNTED;
         usb_cmd_on_going = false;
         set3doCDReady(currentImage.dev_addr, true);
         set3doDriveMounted(currentImage.dev_addr, true);
         ret = true;
       } else {
         LOG_SATA("Can not open the Game!\n");
-      }
-    }
-  }
-  if (loaded) {
-    playlist.current_entry++;
-    updatePlayListEntries();
-  }
-
-  return ret;
-}
-
-bool loadBootIso(uint8_t dev_addr) {
-  bool ret = false;
-  FRESULT res;
-  FILINFO fileInfo;
-  LOG_SATA("Load boot.iso\n");
-  dir_t *curDir = getNewDir();
-  char *curPath = (char *) malloc(5);
-  snprintf(curPath, 5, "%d:", dev_addr-1);
-  LOG_SATA("Try to load on %s\n", curPath);
-  device_s *dev = getDevice(dev_addr);
-  res = f_findfirst(&curDir->dir, &fileInfo, curPath, "boot.iso");
-  if ((res != FR_OK) || (strlen(fileInfo.fname) == 0)) {
-    //report error. Boot iso is not found
-    LOG_SATA("Error on %s\n", curPath);
-  } else {
-    //load boot.iso
-    if (extractBootImage(&fileInfo, curPath, dev_addr)) {
-      if (currentImage.curDir != NULL) free(currentImage.curDir);
-      currentImage.curDir = curDir;
-      // memcpy(&currentImage, &allImage[selected_img].info, sizeof(cd_s));
-      if (f_open(&curBinFile, curBinPath, FA_READ) == FR_OK) {
-        last_pos = 0;
-        dev->state = MOUNTED;
-        onBootIso = true;
-        usb_cmd_on_going = false;
-        LOG_SATA("Boot iso path %s\n", currentImage.curPath);
-        set3doCDReady(currentImage.dev_addr, true);
-        set3doDriveMounted(currentImage.dev_addr, true);
-        ret = true;
-      } else {
-        LOG_SATA("Can not open the Game!\n");
-        if (currentImage.curDir != NULL) free(currentImage.curDir);
-        if (currentImage.curPath != NULL) free(currentImage.curPath);
-        currentImage.curDir = NULL;
-        currentImage.curPath = NULL;
         currentImage.dev_addr = 0xFF;
         currentImage.lun = 0;
       }
     }
-    else {
-      currentImage.curDir = NULL;
-      currentImage.curPath = NULL;
+  }
+  // The entry is consumed even if it fails, otherwise it would be retried forever
+  playlist.current_entry++;
+  updatePlayListEntries();
+
+  return ret;
+}
+
+static bool loadBootIso(uint8_t dev_addr) {
+  bool ret = false;
+  FRESULT res;
+  FILINFO fileInfo;
+  LOG_SATA("Load boot.iso\n");
+  device_s *dev = getDevice(dev_addr);
+  if (dev == NULL) return false;
+  dir_t *curDir = getNewDir();
+  char *curPath = (char *) malloc(8);
+  if ((curDir == NULL) || (curPath == NULL)) {
+    free(curDir);
+    free(curPath);
+    return false;
+  }
+  snprintf(curPath, 8, "%d:", dev_addr-1);
+  LOG_SATA("Try to load on %s\n", curPath);
+  res = f_findfirst(&curDir->dir, &fileInfo, curPath, "boot.iso");
+  if ((res != FR_OK) || (strlen(fileInfo.fname) == 0)) {
+    //report error. Boot iso is not found
+    LOG_SATA("Error on %s\n", curPath);
+  } else if (extractBootImage(&fileInfo, curPath, dev_addr)) {
+    // currentImage owns curPath now
+    if (currentImage.curDir != NULL) free(currentImage.curDir);
+    currentImage.curDir = curDir;
+    if (openBinFile(0)) {
+      dev->state = MOUNTED;
+      onBootIso = true;
+      usb_cmd_on_going = false;
+      // Fresh menu context on the boot device
+      current_toc_level = 0;
+      current_toc = 0x00000000;
+      current_toc_offset = 0;
+      LOG_SATA("Boot iso path %s\n", currentImage.curPath);
+      set3doCDReady(currentImage.dev_addr, true);
+      set3doDriveMounted(currentImage.dev_addr, true);
+      ret = true;
+    } else {
+      LOG_SATA("Can not open the Game!\n");
+      // Frees curDir and curPath which are owned by currentImage
+      releaseImageContext();
+      clearBinFiles();
       currentImage.dev_addr = 0xFF;
       currentImage.lun = 0;
-      LOG_SATA("Can not extract on %s\n", curPath);
+      return false;
     }
+  } else {
+    LOG_SATA("Can not extract on %s\n", curPath);
   }
   if (!ret) {
     free(curDir);
@@ -954,13 +805,16 @@ bool loadBootIso(uint8_t dev_addr) {
   return ret;
 }
 
-static bool handleBootImage(uint8_t dev_addr) {
-  device_s *dev = getDevice(currentImage.dev_addr);
-  if ((currentImage.dev_addr != 0xFF) && (dev->type == MSC_TYPE) && (currentImage.dev_addr != dev_addr)) {
+bool loadBootImage(uint8_t dev_addr) {
+  device_s *dev = getDevice(dev_addr);
+  if ((dev == NULL) || (dev->type != MSC_TYPE) || !dev->isFatFs) return false;
+  device_s *cur = getDevice(currentImage.dev_addr);
+  if ((cur != NULL) && (cur->type == MSC_TYPE) && (currentImage.dev_addr != dev_addr)) {
+    // The image is on another device: nothing to do from this one
     LOG_SATA("Boot image is on %d\n", currentImage.dev_addr);
-    return true;
+    return false;
   }
-  LOG_SATA("Handle Boot image %d (%d)\n", onMountMode, playlist.nb_entries);
+  LOG_SATA("Handle Boot image (%d)\n", playlist.nb_entries);
   if (playlist.nb_entries != 0) {
     LOG_SATA("Handle playlist\n");
     return loadPlaylistEntry(dev_addr);
@@ -978,8 +832,9 @@ bool MSC_Inquiry(uint8_t dev_addr, uint8_t lun) {
     return false;
   }
   device_s *dev = getDevice(dev_addr);
-  char path[7];
-  snprintf(path, 7, "%d://", dev_addr-1);
+  if (dev == NULL) return false;
+  char path[8];
+  snprintf(path, sizeof(path), "%d:", dev_addr-1);
   LOG_SATA("Try to mount on %s\n", path);
   result = f_mount(&dev->DiskFATState, path , 1);
   if (result!=FR_OK) {
@@ -992,6 +847,7 @@ bool MSC_Inquiry(uint8_t dev_addr, uint8_t lun) {
   dev->useable = true;
   LOG_SATA("MSC mounted here: %s\n", path);
   mediaInterrupt();
+  return true;
 }
 
 int getTocLevel(void) {
@@ -999,7 +855,7 @@ int getTocLevel(void) {
 }
 
 int getTocIndex(void) {
-  return current_toc>>24;
+  return ((unsigned int)current_toc)>>24;
 }
 
 int getTocEntry(int index) {
@@ -1012,34 +868,37 @@ static bool isUp(int index) {
 
 void setTocLevel(int index) {
   if (currentImage.dev_addr == 0xFF) return;
-  FRESULT res;
   FILINFO fileInfo;
-  int curDirNb = 0;
-  LOG_SATA("current_toc %d (%d) vs %d (%d) current_toc_level %d\n", getTocEntry(current_toc), current_toc>>24, getTocEntry(index), index>>24, current_toc_level);
+  LOG_SATA("current_toc %d (%d) vs %d (%d) current_toc_level %d\n", getTocEntry(current_toc), getTocIndex(), getTocEntry(index), ((unsigned int)index)>>24, current_toc_level);
   if (isUp(index)) {
+    if (currentImage.curPath == NULL) return;
     LOG_SATA("Set Toc Level start %s level %d\n", currentImage.curPath, current_toc_level);
     if ((current_toc_level == 1)&&(getDeviceCount()>1)) {
-      f_closedir(&currentImage.curDir->dir);
+      // Back to the device list
+      if (currentImage.curDir != NULL) {
+        f_closedir(&currentImage.curDir->dir);
+        free(currentImage.curDir);
+        currentImage.curDir = NULL;
+      }
       free(currentImage.curPath);
       currentImage.curPath = NULL;
       current_toc_level = 0;
-      // current_toc_index = 0xFF;
       current_toc = 0x00000000;
     } else {
-      char *lastDir = rindex(currentImage.curPath, '\\');
-      if (lastDir != NULL) {
-        bool found = false;
+      char *lastDir = strrchr(currentImage.curPath, '\\');
+      if ((lastDir != NULL) && (currentImage.curDir != NULL)) {
         char *newPath = malloc(lastDir - currentImage.curPath + 1);
+        if (newPath == NULL) return;
         memcpy(newPath, currentImage.curPath, lastDir - currentImage.curPath);
         newPath[lastDir-currentImage.curPath] = 0;
         f_closedir(&currentImage.curDir->dir);
-        res = f_opendir(&currentImage.curDir->dir, newPath);
+        f_opendir(&currentImage.curDir->dir, newPath);
         current_toc_offset = 0;
         free(currentImage.curPath);
         currentImage.curPath = newPath;
         LOG_SATA("Set Toc Level path %s\n", currentImage.curPath);
         current_toc &= ~0xFFFFFF;
-        current_toc_level -= 1;
+        if (current_toc_level > 0) current_toc_level -= 1;
       }
     }
     LOG_SATA("New current_toc_level %d\n", current_toc_level);
@@ -1049,48 +908,59 @@ void setTocLevel(int index) {
     //need to change the current TOC level
     //Get required Toc Entry
     if (((getTocEntry(index)) == 0) && (current_toc_level == 0)){
-      int idx = (index>>24)-1;
+      int idx = (((unsigned int)index)>>24)-1;
       if (idx < 0) idx = 0;
-      currentImage.curDir = getNewDir();
-      currentImage.curPath = (char*)malloc(20 * sizeof(char));
-      // current_toc_index = index>>24;
-      snprintf(currentImage.curPath, 20, "%d://", idx);
-      res = f_opendir(&currentImage.curDir->dir, currentImage.curPath);
+      dir_t *newDir = getNewDir();
+      char *newPath = (char*)malloc(20 * sizeof(char));
+      if ((newDir == NULL) || (newPath == NULL)) {
+        free(newDir);
+        free(newPath);
+        return;
+      }
+      // Release the previous context before replacing it
+      if (currentImage.curDir != NULL) {
+        f_closedir(&currentImage.curDir->dir);
+        free(currentImage.curDir);
+      }
+      if (currentImage.curPath != NULL) free(currentImage.curPath);
+      currentImage.curDir = newDir;
+      currentImage.curPath = newPath;
+      snprintf(currentImage.curPath, 20, "%d:", idx);
+      f_opendir(&currentImage.curDir->dir, currentImage.curPath);
       current_toc_offset = 0;
       current_toc_level++;
       LOG_SATA("Setup root path to %s\n", currentImage.curPath);
     } else {
+      if ((currentImage.curDir == NULL) || (currentImage.curPath == NULL)) return;
       int i = 0;
       LOG_SATA("Load path %s\n", currentImage.curPath);
       f_closedir(&currentImage.curDir->dir);
       f_opendir(&currentImage.curDir->dir, currentImage.curPath);
+      current_toc_offset = 0;
+      fileInfo.fname[0] = 0;
       while(i < getTocEntry(index)) {
         LOG_SATA("Look for entry %d\n", i);
         if (getNextValidToc(&fileInfo)) {
           i++;
           current_toc_offset++;
-        }
-        if (fileInfo.fname[0] == 0) {
+        } else if (fileInfo.fname[0] == 0) {
           //Should raise en arror. Shall never happen
           LOG_SATA("!!! WTF not found\n");
-          LOG_SATA("New current_toc_level %d\n", current_toc_level);
           return; //End of file list
         }
       }
       LOG_SATA("Finish at entry %d\n", i);
       if (fileInfo.fattrib & AM_DIR) {
-        int i = strlen(fileInfo.fname);
-        char *newPath = malloc(strlen(currentImage.curPath)+i+2);
-        sprintf(&newPath[0], "%s\\%s", currentImage.curPath, fileInfo.fname);
+        char *newPath = joinPath(currentImage.curPath, fileInfo.fname);
+        if (newPath == NULL) return;
         free(currentImage.curPath);
         currentImage.curPath = newPath;
         LOG_SATA("Set Toc Level path  to dir %s\n", currentImage.curPath);
         f_closedir(&currentImage.curDir->dir);
-        res = f_opendir(&currentImage.curDir->dir, currentImage.curPath);
+        f_opendir(&currentImage.curDir->dir, currentImage.curPath);
         current_toc_offset = 0;
         current_toc_level++;
       } else {
-        LOG_SATA("New current_toc_level %d\n", current_toc_level);
         LOG_SATA("!!! WTF not a directory\n");
       }
     }
@@ -1104,11 +974,11 @@ void setTocLevel(int index) {
 }
 
 static bool getNextValidToc(FILINFO *fileInfo) {
-  if (currentImage.dev_addr == 0xFF) return;
+  fileInfo->fname[0] = 0;
+  if ((currentImage.dev_addr == 0xFF) || (currentImage.curDir == NULL)) return false;
   FRESULT res;
   res = f_readdir(&currentImage.curDir->dir, fileInfo);                   /* Read a directory item */
   if (res != FR_OK) fileInfo->fname[0] = 0;  /* Break on error or end of dir */
-  // Ne bouger que si dir, iso ou cue, a voir
   if (fileInfo->fname[0] == 0) return false;  /* Break on error or end of dir */
   if ((fileInfo->fname[0] == '.') || (fileInfo->fattrib & (AM_HID | AM_SYS))) return false;
   if (strlen(fileInfo->fname) >= TOC_NAME_LIMIT) return false;
@@ -1120,18 +990,19 @@ static bool getNextValidToc(FILINFO *fileInfo) {
 }
 
 bool seekTocTo(int index) {
-  if (currentImage.dev_addr == 0xFF) return;
+  if ((currentImage.dev_addr == 0xFF) || (currentImage.curDir == NULL) || (currentImage.curPath == NULL)) return false;
   FILINFO fileInfo;
   int i = 0;
   f_closedir(&currentImage.curDir->dir);
-  f_opendir(&currentImage.curDir->dir, currentImage.curPath);
+  if (f_opendir(&currentImage.curDir->dir, currentImage.curPath) != FR_OK) return false;
   current_toc_offset = 0;
   while(i < index) {
     if (getNextValidToc(&fileInfo)) {
       i++;
       current_toc_offset++;
+    } else if (fileInfo.fname[0] == 0) {
+      return false; //End of file list
     }
-    if (fileInfo.fname[0] == 0) return false; //End of file list
   }
   return true;
 }
@@ -1142,8 +1013,8 @@ bool getReturnTocEntry(toc_entry* toc) {
   toc->toc_id = 0xFFFFFFFF;
   toc->name_length = 3;
   toc->name = malloc(toc->name_length);
+  if (toc->name == NULL) return false;
   snprintf(toc->name, toc->name_length, "..");
-  toc->name[2] = 0;
   return true;
 }
 
@@ -1164,91 +1035,57 @@ bool getNextTOCEntry(toc_entry* toc) {
   toc->toc_id = current_toc_offset;
   toc->name_length = strlen(fileInfo.fname) + 1;
   toc->name = malloc(toc->name_length);
-  snprintf(toc->name, toc->name_length, "%s", fileInfo.fname);
-  toc->name[toc->name_length-1] = 0;
+  if (toc->name == NULL) return false;
+  memcpy(toc->name, fileInfo.fname, toc->name_length);
   return true;
 }
 
-void requestOpenFile(char* name, uint16_t name_length, bool write) {
-  if (currentImage.dev_addr == 0xFF) return;
-  uint16_t length = name_length + strlen(currentImage.curPath) + 1;
-  if (curFilePath != NULL) free(curFilePath);
-  curFilePath = malloc(length);
-  curFileMode = write;
-  snprintf(&curFilePath[0], length, "%s\\%s", currentImage.curPath, name);
-  fileCmdRequired = OPEN;
+//--------------------------------------------------------------------+
+// Data files for the ODE menu (saves, settings...)
+//--------------------------------------------------------------------+
+static FIL curDataFile;
+static bool dataFileOpen = false;
+
+bool closeDataFile(void) {
+  if (!dataFileOpen) return true;
+  dataFileOpen = false;
+  return (f_close(&curDataFile) == FR_OK);
 }
 
-void requestWriteFile(uint8_t* buf, uint16_t length) {
-  curBuf = buf;
-  curBufLength = length;
-  fileCmdRequired = WRITE;
+bool openDataFile(const char* name, uint16_t name_length, bool write) {
+  closeDataFile();
+  if ((currentImage.dev_addr == 0xFF) || (currentImage.curPath == NULL) || (name == NULL)) return false;
+  // The name sent by the 3DO is not always 0 terminated
+  size_t len = strnlen(name, name_length);
+  if (len == 0) return false;
+  size_t length = strlen(currentImage.curPath) + 1 + len + 1;
+  char *path = malloc(length);
+  if (path == NULL) return false;
+  snprintf(path, length, "%s\\%.*s", currentImage.curPath, (int)len, name);
+  BYTE mode = write ? (FA_WRITE | FA_READ | FA_OPEN_ALWAYS) : FA_READ;
+  dataFileOpen = (f_open(&curDataFile, path, mode) == FR_OK);
+  free(path);
+  return dataFileOpen;
 }
 
-void requestReadFile(uint8_t* buf, uint16_t length) {
-  curBuf = buf;
-  curBufLength = length;
-  fileCmdRequired = READ;
+bool writeDataFile(const uint8_t* buf, uint16_t length, uint16_t *written) {
+  UINT nb_write = 0;
+  *written = 0;
+  if (!dataFileOpen) return false;
+  bool ok = (f_write(&curDataFile, buf, length, &nb_write) == FR_OK);
+  ok &= (f_sync(&curDataFile) == FR_OK);
+  *written = nb_write;
+  return ok && (nb_write == length);
 }
 
-void requestCloseFile() {
-  fileCmdRequired = CLOSE;
+bool readDataFile(uint8_t* buf, uint16_t length, uint16_t *read) {
+  UINT nb_read = 0;
+  *read = 0;
+  if (!dataFileOpen) return false;
+  FRESULT res = f_read(&curDataFile, buf, length, &nb_read);
+  if (res != FR_OK) LOG_SATA("Issue while reading %d (%d) => %x\n", length, nb_read, res);
+  *read = nb_read;
+  return (res == FR_OK);
 }
-
-static void check_open_file() {
-  usb_cmd_on_going = true;
-  usb_result = false;
-  usb_result = (f_open(&curDataFile, curFilePath,  FA_WRITE| FA_READ |FA_OPEN_ALWAYS) == FR_OK);
-  usb_cmd_on_going = false;
-}
-
-static void check_write_file() {
-  usb_cmd_on_going = true;
-  uint nb_write;
-  usb_result =(f_write(&curDataFile, curBuf, curBufLength, &nb_write) == FR_OK);
-  usb_result =(f_sync(&curDataFile) == FR_OK);
-  usb_cmd_on_going = false;
-}
-
-static void check_read_file() {
-  usb_cmd_on_going = true;
-  uint nb_read;
-  FRESULT res = f_read(&curDataFile, curBuf, curBufLength, &nb_read);
-  usb_result = (res == FR_OK);
-  if (!usb_result) LOG_SATA("Issue while reading %d (%d) => %x\n", curBufLength, nb_read,res);
-  usb_cmd_on_going = false;
-}
-
-
-static void check_close_file() {
-  usb_cmd_on_going = true;
-  usb_result = (f_close(&curDataFile) == FR_OK);
-  usb_cmd_on_going = false;
-}
-
-static void check_file(uint8_t dev_addr) {
-  switch(fileCmdRequired) {
-    case OPEN:
-      check_open_file();
-      fileCmdRequired = DONE;
-    break;
-    case WRITE:
-      check_write_file();
-      fileCmdRequired = DONE;
-    break;
-    case READ:
-      check_read_file();
-      fileCmdRequired = DONE;
-    break;
-    case CLOSE:
-      check_close_file();
-      fileCmdRequired = DONE;
-    break;
-    default:
-    break;
-  }
-}
-
-//Need a umount callback
 
 #endif

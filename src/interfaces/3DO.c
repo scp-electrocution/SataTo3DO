@@ -6,11 +6,14 @@
 #include "hardware/gpio.h"
 #include "hardware/irq.h"
 #include "hardware/dma.h"
+#include "hardware/sync.h"
 #include "hardware/structs/bus_ctrl.h"
 #include "pico/multicore.h"
+#include "pico/critical_section.h"
 
 #include "3DO.h"
 #include "MSC.h"
+#include "CDROM.h"
 #include "CDFormat.h"
 
 #define DATA_BUS_MASK (0xFF<<CDD0)
@@ -29,18 +32,6 @@
 #else
 #include "write.pio.h"
 #endif
-
-extern bool readBlock(uint32_t start, uint16_t nb_block, uint16_t block_size, uint8_t *buffer);
-extern bool readSubQChannel(uint8_t *buffer);
-extern bool USBDriveEject(uint8_t dev_addr, bool eject);
-extern bool block_is_ready();
-extern bool cmd_is_ready(bool *success);
-extern bool isAudioBlock(uint32_t start);
-extern void wakeUpCDRom(uint8_t dev_addr, uint8_t lun);
-
-extern void USB_reset(void);
-
-extern bool onBootIso;
 
 #define GET_BUS(A) (((A)>>CDD0)&0xFF)
 
@@ -150,14 +141,17 @@ typedef enum {
   CHAN_MAX
 } DMA_chan_t;
 
+// Maximum time to wait for the USB side before reporting a read error
+#define READ_TIMEOUT_MS 10000
 
 dma_channel_config config[CHAN_MAX];
 uint8_t sm[CHAN_MAX];
 uint8_t sm_offset[CHAN_MAX];
 int channel[CHAN_MAX];
 
-int errorOnDisk = 0;
-
+volatile int errorOnDisk = 0;
+// Set when a read requested by the 3DO failed on the USB side
+static volatile bool readError = false;
 
 uint sm_read = -1;
 uint instr_jmp_read;
@@ -174,14 +168,42 @@ static bool use_cdrom = false;
 
 static bool ledState = false;
 
-static bool canHandleReset = false;
+static volatile bool canHandleReset = false;
 
 static int pitch = 0;
 
-static uint8_t errorCode = POWER_OR_RESET_OCCURED;
-static uint8_t status = TRAY_IN | CHECK_ERROR | DISC_RDY;
+// status is updated by both cores: always modify it under the lock
+static critical_section_t statusLock;
+static volatile uint8_t errorCode = POWER_OR_RESET_OCCURED;
+static volatile uint8_t status = TRAY_IN | CHECK_ERROR | DISC_RDY;
 
-void close_tray(bool close) {
+static void statusSet(uint8_t mask) {
+  critical_section_enter_blocking(&statusLock);
+  status |= mask;
+  critical_section_exit(&statusLock);
+}
+
+static void statusClear(uint8_t mask) {
+  critical_section_enter_blocking(&statusLock);
+  status &= ~mask;
+  critical_section_exit(&statusLock);
+}
+
+static void statusAssign(uint8_t value) {
+  critical_section_enter_blocking(&statusLock);
+  status = value;
+  critical_section_exit(&statusLock);
+}
+
+static inline bool inReset(void) {
+  return !gpio_get(CDRST);
+}
+
+//--------------------------------------------------------------------+
+// Jobs executed on core 0 (TinyUSB and FatFs are not usable from core 1)
+//--------------------------------------------------------------------+
+static void closeTrayJob(void *arg) {
+  bool close = *(bool *)arg;
   device_s *dev = NULL;
   bool has_usb = false;
   bool has_cd = false;
@@ -213,7 +235,7 @@ void close_tray(bool close) {
       dev = NULL;
   }
   //But In case we are on Boot menu and there is a CD, eject the CD
-  if (onBootIso & has_cd) {
+  if (onBootIso && has_cd) {
     //on Boot menu, if there is a CDROM, try to eject it.
     for (int i = 0; i<CFG_TUH_DEVICE_MAX; i++) {
       device_s *curdev = getDeviceIndex(i);
@@ -230,9 +252,12 @@ void close_tray(bool close) {
       return;
     }
   }
-  // status &= ~TRAY_IN;
   if (!onBootIso)
     mediaInterrupt();
+}
+
+void close_tray(bool close) {
+  runOnCore0(closeTrayJob, &close);
 }
 
 void wait_out_of_reset() {
@@ -248,6 +273,7 @@ void wait_out_of_reset() {
 void set3doCDReady(uint8_t dev_addr, bool on) {
   if (on && (currentImage.dev_addr == dev_addr)) {
     errorOnDisk = 0;
+    readError = false;
     switch(currentImage.format) {
       case 0x0:
         if (currentImage.hasOnlyAudio)
@@ -263,39 +289,36 @@ void set3doCDReady(uint8_t dev_addr, bool on) {
         LOG_SATA("CD-i detected\n");
         break;
     }
-    status = TRAY_IN | DISC_RDY | DISC_PRESENT | SPINNING;
+    statusAssign(TRAY_IN | DISC_RDY | DISC_PRESENT | SPINNING);
     errorCode = 0;
-    status &= ~CHECK_ERROR;
   } else {
     if (on) LOG_SATA("Current Image is on dev addr %x but CD is %x\n", currentImage.dev_addr, dev_addr);
   }
 
 }
 
+// Core 0 only
 void set3doDriveMounted(uint8_t dev_addr, bool on) {
-  device_s *dev = getDevice(dev_addr);
   if ((currentImage.dev_addr == dev_addr) && (!on)) {
     LOG_SATA("set3doDriveMounted %d\n", on);
-    if (currentImage.curDir != NULL) free(currentImage.curDir);
-    if (currentImage.curPath != NULL) free(currentImage.curPath);
-    currentImage.curDir = NULL;
-    currentImage.curPath = NULL;
-    currentImage.dev_addr = 0xFF;
-    currentImage.lun = 0x0;
+    MSC_releaseCurrentImage();
   }
 }
 
 void set3doDriveReady() {
 }
 
+// Can be called from a USB callback: the USB reset itself is deferred
 void set3doDriveError() {
   LOG_SATA("Drive error\n");
   errorOnDisk = 1;
+  readError = true;
   errorCode = SOFT_READ_RETRY;
+  critical_section_enter_blocking(&statusLock);
   status |= CHECK_ERROR;
-  status &= ~DISC_RDY;
-  status &= ~SPINNING;
-  USB_reset();
+  status &= ~(DISC_RDY | SPINNING);
+  critical_section_exit(&statusLock);
+  USB_requestReset();
 }
 
 bool is3doData() {
@@ -306,6 +329,18 @@ uint32_t get3doData() {
   uint32_t val = 0x0;
   val = pio_sm_get_blocking(pio0, sm_read);
   return val;
+}
+
+// Read the 6 parameter bytes following a command byte.
+// Returns false if the 3DO has been reset meanwhile.
+static bool get3doParams(unsigned int *data_in) {
+  for (int i=0; i<6; i++) {
+    while (!is3doData()) {
+      if (inReset()) return false;
+    }
+    data_in[i] = GET_BUS(get3doData());
+  }
+  return true;
 }
 
 void print_dma_ctrl(dma_channel_hw_t *channel) {
@@ -354,6 +389,23 @@ void startDMA(uint8_t access, uint8_t *buffer, uint32_t nbWord) {
   dma_channel_transfer_from_buffer_now(channel[access], buffer, nbWord);
 }
 
+// Wait for the end of an answer, unless the 3DO is reset meanwhile
+static bool waitEndOfTransfer(uint8_t access) {
+  while (dma_channel_is_busy(channel[access])) {
+    if (inReset()) {
+      dma_channel_abort(channel[access]);
+      return false;
+    }
+  }
+  while(!pio_sm_is_tx_fifo_empty(pio0, sm[access])) {
+    if (inReset()) return false;
+  }
+  while (pio_sm_get_pc(pio0, sm[access]) != sm_offset[access]) {
+    if (inReset()) return false;
+  }
+  return true;
+}
+
 void sendAnswer(uint8_t *buffer, uint32_t nbWord, uint8_t access) {
   restartPio(access);
   startDMA(access, buffer, nbWord);
@@ -361,19 +413,24 @@ void sendAnswer(uint8_t *buffer, uint32_t nbWord, uint8_t access) {
   setDataDir(DATA_OUT); //Output data
   gpio_put(CDSTEN + access, 0x0);
 
-  dma_channel_wait_for_finish_blocking(access);
-  while(!pio_sm_is_tx_fifo_empty(pio0, sm[access]));
-  while (pio_sm_get_pc(pio0, sm[access]) != sm_offset[access]);
+  waitEndOfTransfer(access);
   gpio_put(CDSTEN + access, 0x1);
   setDataDir(DATA_IN); //input data
   pio_sm_set_consecutive_pindirs(pio0, sm[access], CDD0, 8, false);
   pio_sm_set_enabled(pio0, sm[access], false);
 }
 
+static void stopDataTransfer(void) {
+  pio_sm_set_enabled(pio0, sm[CHAN_WRITE_DATA], false);
+  pio_sm_set_consecutive_pindirs(pio0, sm[CHAN_WRITE_DATA], CDD0, 8, false);
+  gpio_put(CDDTEN, true);
+  setDataDir(DATA_IN); //Input data
+}
+
 bool sendAnswerStatusMixed(uint8_t *buffer, uint32_t nbWord, uint8_t *buffer_status, uint8_t nbStatus, bool last, bool trace) {
   bool statusStarted = false;
   bool interrupted = false;
-  absolute_time_t a,b,c,d,e, s = get_absolute_time();
+  absolute_time_t a = nil_time, b = nil_time, c = nil_time, d = nil_time, e = nil_time, s = get_absolute_time();
   bool lastCDEN = gpio_get(CDEN);
   if (trace) a= get_absolute_time();
   restartPio(CHAN_WRITE_DATA);
@@ -391,7 +448,12 @@ bool sendAnswerStatusMixed(uint8_t *buffer, uint32_t nbWord, uint8_t *buffer_sta
   if (trace)
     LOG_SATA("a %lld, b %lld, c %lld, d %lld, e %lld\n", absolute_time_diff_us(s,a), absolute_time_diff_us(a,b), absolute_time_diff_us(b,c), absolute_time_diff_us(c,d), absolute_time_diff_us(d,e));
 
-  while (dma_channel_is_busy(CHAN_WRITE_DATA)) {
+  while (dma_channel_is_busy(channel[CHAN_WRITE_DATA])) {
+    if (inReset()) {
+      dma_channel_abort(channel[CHAN_WRITE_DATA]);
+      stopDataTransfer();
+      return false;
+    }
     if (gpio_get(CDEN) != lastCDEN) {
         lastCDEN = !lastCDEN;
         pio_sm_set_consecutive_pindirs(pio0, sm[CHAN_WRITE_DATA], CDD0, 8, !lastCDEN);
@@ -409,10 +471,8 @@ bool sendAnswerStatusMixed(uint8_t *buffer, uint32_t nbWord, uint8_t *buffer_sta
 
     if (!gpio_get(CDHWR))
     {
-      pio_sm_set_enabled(pio0, sm[CHAN_WRITE_DATA], false);
-      pio_sm_set_consecutive_pindirs(pio0, sm[CHAN_WRITE_DATA], CDD0, 8, false);
-      gpio_put(CDDTEN, true);
-      setDataDir(DATA_IN); //Input data
+      dma_channel_abort(channel[CHAN_WRITE_DATA]);
+      stopDataTransfer();
       return false;
     }
 
@@ -424,8 +484,12 @@ bool sendAnswerStatusMixed(uint8_t *buffer, uint32_t nbWord, uint8_t *buffer_sta
       pio_sm_set_enabled(pio0, sm[CHAN_WRITE_DATA], true);
     }
   }
-  while(!pio_sm_is_tx_fifo_empty(pio0, sm[CHAN_WRITE_DATA]));
-  while (pio_sm_get_pc(pio0, sm[CHAN_WRITE_DATA]) != sm_offset[CHAN_WRITE_DATA]);
+  while(!pio_sm_is_tx_fifo_empty(pio0, sm[CHAN_WRITE_DATA])) {
+    if (inReset()) { stopDataTransfer(); return false; }
+  }
+  while (pio_sm_get_pc(pio0, sm[CHAN_WRITE_DATA]) != sm_offset[CHAN_WRITE_DATA]) {
+    if (inReset()) { stopDataTransfer(); return false; }
+  }
   gpio_put(CDDTEN, 0x1);
   setDataDir(DATA_IN); //Input data
   if (!interrupted && last) sendAnswer(buffer_status, nbStatus, CHAN_WRITE_STATUS);
@@ -437,91 +501,88 @@ bool sendAnswerStatusMixed(uint8_t *buffer, uint32_t nbWord, uint8_t *buffer_sta
 static uint8_t TOC[2048] = {0};
 uint8_t FILE_BUFFER[2048] = {0};
 
-static void handleTocChange(int index) {
-  toc_entry toc;
-  //switch to the right TOC level
-  setTocLevel(index);
+static uint32_t read32(const uint8_t *p) {
+  return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|((uint32_t)p[3]<<0);
 }
 
+static void write32(uint8_t *p, uint32_t v) {
+  p[0] = v>>24;
+  p[1] = v>>16;
+  p[2] = v>>8;
+  p[3] = v&0xff;
+}
+
+// Append one entry to the TOC buffer. Returns the new length, or -1 if it does not fit
+static int appendTocEntry(int toclen, uint32_t flags, uint32_t toc_id, const char *name, uint32_t name_length) {
+  if ((toclen < 0) || ((size_t)toclen + 12 + name_length > sizeof(TOC))) return -1;
+  write32(&TOC[toclen], flags);
+  write32(&TOC[toclen+4], toc_id);
+  write32(&TOC[toclen+8], name_length);
+  memcpy(&TOC[toclen+12], name, name_length);
+  return toclen + 12 + name_length;
+}
+
+// Core 0 only (called through the playlist)
 char* getPathForTOC(int entry) {
   if (getTocEntry(entry)==0x0) {
-    device_s *dev = getDevice(entry>>24);
-    if (!dev->useable) return NULL;
-    char* result = malloc(7);
-    snprintf(result, 7, "%d://", (entry>>24)-1);
+    // A whole device: only a CD drive can be played
+    device_s *dev = getDevice(((uint32_t)entry)>>24);
+    if ((dev == NULL) || !dev->useable || (dev->type != CD_TYPE)) return NULL;
+    char* result = malloc(8);
+    if (result == NULL) return NULL;
+    snprintf(result, 8, "%d://", dev->dev_addr-1);
     return result;
-  } else {
-    for (int i=0; i<2048;) {
-      uint32_t flags = (TOC[i++]<<24)|(TOC[i++]<<16)|(TOC[i++]<<8)|(TOC[i++]<<0);
-      if (flags != TOC_FLAG_INVALID) {
-        uint32_t toc_id = (TOC[i++]<<24)|(TOC[i++]<<16)|(TOC[i++]<<8)|(TOC[i++]<<0);
-        uint32_t name_length = (TOC[i++]<<24)|(TOC[i++]<<16)|(TOC[i++]<<8)|(TOC[i++]<<0);
-        if (toc_id == entry) {
-          if (flags != TOC_FLAG_FILE) return NULL;
-          int pathLength = name_length + 1 + strlen(currentImage.curPath)+1;
-          char* result = malloc(pathLength);
-          snprintf(result, pathLength, "%s\\%s", currentImage.curPath, &TOC[i]);
-          return result;
-        }
-        i += name_length;
-      } else {
-        return NULL;
-      }
+  }
+  if (currentImage.curPath == NULL) return NULL;
+  size_t i = 0;
+  while (i + 12 <= sizeof(TOC)) {
+    uint32_t flags = read32(&TOC[i]);
+    if (flags == TOC_FLAG_INVALID) return NULL;
+    uint32_t toc_id = read32(&TOC[i+4]);
+    uint32_t name_length = read32(&TOC[i+8]);
+    i += 12;
+    if (name_length > sizeof(TOC) - i) return NULL;
+    if (toc_id == (uint32_t)entry) {
+      if (flags != TOC_FLAG_FILE) return NULL;
+      size_t len = strnlen((const char *)&TOC[i], name_length);
+      size_t pathLength = strlen(currentImage.curPath) + 1 + len + 1;
+      char* result = malloc(pathLength);
+      if (result == NULL) return NULL;
+      snprintf(result, pathLength, "%s\\%.*s", currentImage.curPath, (int)len, (const char *)&TOC[i]);
+      return result;
     }
+    i += name_length;
   }
   return NULL;
 }
 
+// Core 0 only
 void getTocFull(int index, int nb) {
   int toclen = 0;
   int id = 0;
   bool ended = false;
   memset(TOC,0xff,sizeof(TOC));
   if ((getTocLevel() == 0) && (getDeviceCount()>1)) {
-    int max = CFG_TUH_DEVICE_MAX;
-    if (nb<CFG_TUH_DEVICE_MAX) max = nb;
     int nbUsb = 0;
     int nbCD = 0;
-    for (int i=0; i<max; i++) {
+    int listed = 0;
+    for (int i=0; i<CFG_TUH_DEVICE_MAX; i++) {
+      if ((nb > 0) && (listed >= nb)) break;
       device_s *dev = getDeviceIndex(i);
-      if (dev->type != UNKNOWN_TYPE) {
-        toc_entry *te = malloc(sizeof(toc_entry));
-        memset(te, 0x0, sizeof(toc_entry));
-        char name[20];
-        if (dev->type == CD_TYPE) {
-          snprintf(name, 20, "CD %d", nbCD);
-          nbCD++;
-        }
-        if (dev->type == MSC_TYPE) {
-          snprintf(name, 20, "USB %d", nbUsb);
-          nbUsb++;
-        }
-        te->flags = (dev->isFatFs)?TOC_FLAG_DIR:TOC_FLAG_FILE;
-        te->toc_id = dev->dev_addr<<24;
-        te->name_length = strlen(name) + 1;
-        te->name = malloc(te->name_length);
-        snprintf(te->name, te->name_length, "%s", name);
-        te->name[te->name_length-1] = 0;
-
-        TOC[toclen++]=te->flags>>24;
-        TOC[toclen++]=te->flags>>16;
-        TOC[toclen++]=te->flags>>8;
-        TOC[toclen++]=te->flags&0xff;
-        TOC[toclen++]=te->toc_id>>24;
-        TOC[toclen++]=te->toc_id>>16;
-        TOC[toclen++]=te->toc_id>>8;
-        TOC[toclen++]=te->toc_id&0xff;
-        TOC[toclen++]=te->name_length>>24;
-        TOC[toclen++]=te->name_length>>16;
-        TOC[toclen++]=te->name_length>>8;
-        TOC[toclen++]=te->name_length&0xff;
-        for(uint32_t t=0;t<te->name_length;t++) {
-          TOC[toclen++]=te->name[t];
-        }
-        if (te->name != NULL) free(te->name);
-        free(te);
+      if ((dev->dev_addr == 0xFF) || (dev->type == UNKNOWN_TYPE)) continue;
+      char name[20];
+      if (dev->type == CD_TYPE) {
+        snprintf(name, sizeof(name), "CD %d", nbCD);
+        nbCD++;
+      } else {
+        snprintf(name, sizeof(name), "USB %d", nbUsb);
+        nbUsb++;
       }
-
+      uint32_t flags = (dev->isFatFs)?TOC_FLAG_DIR:TOC_FLAG_FILE;
+      int newLen = appendTocEntry(toclen, flags, ((uint32_t)dev->dev_addr)<<24, name, strlen(name) + 1);
+      if (newLen < 0) break;
+      toclen = newLen;
+      listed++;
     }
   } else {
     if (!seekTocTo(index)) {
@@ -529,83 +590,162 @@ void getTocFull(int index, int nb) {
       return;
     }
     while(!ended) {
-      toc_entry *te = malloc(sizeof(toc_entry));
-      memset(te, 0x0, sizeof(toc_entry));
+      toc_entry te;
+      memset(&te, 0x0, sizeof(toc_entry));
       if ((index == 0) && (id == 0) && (getTocLevel() != 0)) {
-        if (!getReturnTocEntry(te)) break;
+        if (!getReturnTocEntry(&te)) break;
       } else {
-        if (!getNextTOCEntry(te)) break;
+        if (!getNextTOCEntry(&te)) break;
       }
       id++;
       if ((nb != -1) && (id >= (nb))) {
-        LOG_SATA("Limit has been reached on Id %d\n", id, nb);
+        LOG_SATA("Limit has been reached on Id %d (%d)\n", id, nb);
         ended = true;
-      } else {
-        LOG_SATA("Got %d files on %d\n", id, nb+index);
       }
-      te->toc_id &= ~(0xFF<<24);
-      te->toc_id |= getTocIndex()<<24;
-      TOC[toclen++]=te->flags>>24;
-      TOC[toclen++]=te->flags>>16;
-      TOC[toclen++]=te->flags>>8;
-      TOC[toclen++]=te->flags&0xff;
-      TOC[toclen++]=te->toc_id>>24;
-      TOC[toclen++]=te->toc_id>>16;
-      TOC[toclen++]=te->toc_id>>8;
-      TOC[toclen++]=te->toc_id&0xff;
-      TOC[toclen++]=te->name_length>>24;
-      TOC[toclen++]=te->name_length>>16;
-      TOC[toclen++]=te->name_length>>8;
-      TOC[toclen++]=te->name_length&0xff;
-      for(uint32_t t=0;t<te->name_length;t++) {
-        TOC[toclen++]=te->name[t];
-      }
-      if (te->name != NULL) free(te->name);
-      free(te);
-      if (toclen > (sizeof(TOC)-(128+13))) {
+      te.toc_id &= ~(0xFFu<<24);
+      te.toc_id |= ((uint32_t)getTocIndex())<<24;
+      int newLen = appendTocEntry(toclen, te.flags, te.toc_id, te.name, te.name_length);
+      if (te.name != NULL) free(te.name);
+      if (newLen < 0) {
         LOG_SATA("Buffer is full\n");
-        ended = true;
+        break;
       }
+      toclen = newLen;
     }
-
   }
-
 }
 
+// Core 0 only
 void getToc(int index, int offset, uint8_t* buffer) {
   if (offset == 0) {
     //init the TOC buffer
     getTocFull(index, -1);
   }
-  memcpy(buffer, &TOC[offset], 16);
+  memset(buffer, 0xFF, 16);
+  if ((offset >= 0) && ((size_t)offset < sizeof(TOC))) {
+    size_t len = sizeof(TOC) - offset;
+    if (len > 16) len = 16;
+    memcpy(buffer, &TOC[offset], len);
+  }
+}
 
+typedef struct {
+  int index;
+  int offset;
+  uint8_t *buffer;
+  int entry;
+  bool valid;
+  bool added;
+} toc_job_t;
+
+static void getTocJob(void *arg) {
+  toc_job_t *j = (toc_job_t *)arg;
+  getToc(j->index, j->offset, j->buffer);
+}
+
+static void getTocFullJob(void *arg) {
+  toc_job_t *j = (toc_job_t *)arg;
+  getTocFull(j->index, j->offset);
+}
+
+static void setTocLevelJob(void *arg) {
+  toc_job_t *j = (toc_job_t *)arg;
+  setTocLevel(j->index);
+}
+
+static void addToPlaylistJob(void *arg) {
+  toc_job_t *j = (toc_job_t *)arg;
+  addToPlaylist(j->entry, &j->valid, &j->added);
+}
+
+static void clearPlaylistJob(void *arg) {
+  (void) arg;
+  clearPlaylist();
+}
+
+typedef struct {
+  const char *name;
+  uint8_t *buf;
+  uint16_t length;
+  uint16_t done;
+  bool write;
+  bool success;
+} file_job_t;
+
+static void openFileJob(void *arg) {
+  file_job_t *j = (file_job_t *)arg;
+  j->success = openDataFile(j->name, j->length, j->write);
+}
+
+static void readFileJob(void *arg) {
+  file_job_t *j = (file_job_t *)arg;
+  j->success = readDataFile(j->buf, j->length, &j->done);
+}
+
+static void writeFileJob(void *arg) {
+  file_job_t *j = (file_job_t *)arg;
+  j->success = writeDataFile(j->buf, j->length, &j->done);
+}
+
+static void closeFileJob(void *arg) {
+  file_job_t *j = (file_job_t *)arg;
+  j->success = closeDataFile();
+}
+
+// Wait for the USB side. Returns false on error, timeout or 3DO reset.
+static bool waitForBlock(void) {
+  absolute_time_t deadline = make_timeout_time_ms(READ_TIMEOUT_MS);
+  while(!block_is_ready()) {
+    if (readError || inReset()) return false;
+    if (time_reached(deadline)) {
+      LOG_SATA("USB read timeout\n");
+      set3doDriveError();
+      return false;
+    }
+  }
+  return !readError;
 }
 
 absolute_time_t lastPacket;
+// Static: a 2449 bytes sector does not fit on the core 1 stack
+static uint8_t dataBuffer[2500];
+
 void sendData(int startlba, int nb_block, bool trace) {
 
-  uint8_t buffer[2500];
   uint8_t status_buffer[2] = {READ_DATA, status};
-  int start = startlba;
-  absolute_time_t a,b,c,d,e, s;
+  absolute_time_t a = nil_time, b = nil_time, c = nil_time, d = nil_time, e = nil_time, s;
   int reste = 0;
+  uint32_t size = currentImage.block_size_read;
 
-  if (nb_block == 0) return;
-  int id = 0;
+  if ((nb_block <= 0) || (startlba < 0) || (size == 0) || (size > sizeof(dataBuffer))) {
+    if (nb_block > 0) {
+      statusSet(CHECK_ERROR);
+      errorCode = (startlba < 0) ? ILLEGAL_LBA : ILLEGAL_MODE;
+    }
+    // Nothing to send: just give the status back
+    status_buffer[1] = status;
+    sendAnswer(status_buffer, 2, CHAN_WRITE_STATUS);
+    return;
+  }
   while (nb_block != 0) {
     s = get_absolute_time();
-    int current = id;
-    int data_idx = 0;
     if (trace) a= get_absolute_time();
     if (!(status & DISC_PRESENT)) {
       return;
     }
 
-    readBlock(startlba, 1, currentImage.block_size_read, &buffer[0]);
+    readError = false;
+    readBlock(startlba, 1, size, &dataBuffer[0]);
     if (trace) b= get_absolute_time();
-    while(!block_is_ready() && !errorOnDisk && gpio_get(CDRST));
+    bool ok = waitForBlock();
 
-    if (!gpio_get(CDRST)) return;
+    if (inReset()) return;
+    if (!ok) {
+      // Do not send garbage: report the error in the status
+      status_buffer[1] = status;
+      sendAnswer(status_buffer, 2, CHAN_WRITE_STATUS);
+      return;
+    }
     if (isAudioBlock(startlba)) {
       int timeForASecond = (990 + pitch) * 1000 + reste;  //Shall be 1s but cd drive is a bit slower than expected
       int correctedDelay = timeForASecond/75;
@@ -623,9 +763,9 @@ void sendData(int startlba, int nb_block, bool trace) {
     if (trace) c = get_absolute_time();
     nb_block--;
     startlba++;
-    id = (id++)%2;
     if (trace) d= get_absolute_time();
-    if (!sendAnswerStatusMixed(&buffer[0], currentImage.block_size_read, status_buffer, 2, nb_block == 0, trace)) return;
+    status_buffer[1] = status;
+    if (!sendAnswerStatusMixed(&dataBuffer[0], size, status_buffer, 2, nb_block == 0, trace)) return;
     if (trace) e = get_absolute_time();
     if (trace)
       LOG_SATA("send data a %lld, b %lld, c %lld, d %lld, e %lld\n", absolute_time_diff_us(s,a), absolute_time_diff_us(a,b), absolute_time_diff_us(b,c), absolute_time_diff_us(c,d), absolute_time_diff_us(d,e));
@@ -639,51 +779,21 @@ void sendRawData(int command, uint8_t *buffer, int length) {
   if (!sendAnswerStatusMixed(buffer, length, status_buffer, 2, true, false)) return;
 }
 
-static bool hasMediaInterrupt = false;
+static volatile bool hasMediaInterrupt = false;
 void mediaInterrupt(void) {
   hasMediaInterrupt = true;
-  // canHandleReset = false;
-  // status |= TRAY_IN;
 }
-void handleMediaInterrupt() {
-  if (!hasMediaInterrupt) return;
-  if ((status & DISC_PRESENT) && !canHandleReset) {
-    gpio_put(LED, ledState);
-    ledState = !ledState;
-    return;
-  }
-  hasMediaInterrupt = false;
-  // gpio_set_dir(CDRST, true);
-  // gpio_put(CDRST, 0);
-  // pio_sm_set_enabled(pio0, sm_read, false);
-  // gpio_put(CDMDCHG, 1); //Under reset
-  // sleep_ms(200);
-  // gpio_put(CDRST, 1);
-  // gpio_set_dir(CDRST, false);
-  // sleep_ms(150);
-  // gpio_put(CDMDCHG, 0); //Under reset
-  // sleep_ms(10);
-  gpio_put(CDMDCHG, 0); //Under reset
-  status &= ~DISC_PRESENT & ~SPINNING;
-  status |= CHECK_ERROR;
-  errorCode = DISC_REMOVED;
-  sleep_ms(10);
-  while (!pio_sm_is_rx_fifo_empty(pio0, sm_read)) {
-    pio_sm_get(pio0, sm_read);
-  }
+
+// Core 0: find what has to be presented to the 3DO after a media change
+static void mediaChangeJob(void *arg) {
+  (void) arg;
   LOG_SATA("Look for BootImage\n");
   onBootIso = false;
-  if (getPlaylistEntries() == 0) {
-    currentImage.dev_addr = 0xFF;
-    currentImage.lun = 0x0;
+  device_s *current_dev = getDevice(currentImage.dev_addr);
+  if ((getPlaylistEntries() == 0) || (current_dev == NULL) || (current_dev->type == CD_TYPE)) {
+    MSC_releaseCurrentImage();
   }
-  if (currentImage.dev_addr != 0xFF) {
-    device_s *current_dev = getDevice(currentImage.dev_addr);
-    if (current_dev->type == CD_TYPE) {
-      currentImage.dev_addr = 0xFF;
-      currentImage.lun = 0x0;
-    }
-  }
+  bool loaded = false;
   for (int i=0; i<CFG_TUH_DEVICE_MAX; i++) {
     LOG_SATA("Look for BootImage on %d\n", i);
     device_s *dev = getDeviceIndex(i);
@@ -693,9 +803,9 @@ void handleMediaInterrupt() {
     }
     if (dev->type == MSC_TYPE) {
       LOG_SATA("%d is a MSC\n", i);
-      requestBootImage();
-      waitForLoad();
-      LOG_SATA("Loaded on %d\n", i);
+      // Only one image (boot.iso or playlist entry) per media change
+      if (!loaded) loaded = loadBootImage(dev->dev_addr);
+      LOG_SATA("Loaded on %d: %d\n", i, loaded);
     }
     if (dev->type == CD_TYPE) {
       LOG_SATA("%d is a CD (%d)\n", i, dev->state);
@@ -703,31 +813,70 @@ void handleMediaInterrupt() {
       set3doCDReady(dev->dev_addr, dev->state == MOUNTED);
       set3doDriveMounted(dev->dev_addr, dev->state  == MOUNTED);
     }
-
   }
+  if (currentImage.dev_addr == 0xFF) {
+    // Nothing loaded from a USB key: present the first CD with a disc in it
+    for (int i=0; i<CFG_TUH_DEVICE_MAX; i++) {
+      device_s *dev = getDeviceIndex(i);
+      if ((dev->dev_addr != 0xFF) && (dev->type == CD_TYPE) && (dev->state == MOUNTED) && (dev->rawImage.nb_track > 0)) {
+        MSC_releaseCurrentImage();
+        memcpy(&currentImage, &dev->rawImage, sizeof(cd_s));
+        currentImage.curDir = NULL;
+        currentImage.curPath = NULL;
+        set3doCDReady(dev->dev_addr, true);
+        set3doDriveMounted(dev->dev_addr, true);
+        break;
+      }
+    }
+  }
+}
+
+void handleMediaInterrupt() {
+  if (!hasMediaInterrupt) return;
+  if ((status & DISC_PRESENT) && !canHandleReset) {
+    gpio_put(LED, ledState);
+    ledState = !ledState;
+    return;
+  }
+  hasMediaInterrupt = false;
+  gpio_put(CDMDCHG, 0); //Under reset
+  critical_section_enter_blocking(&statusLock);
+  status &= ~(DISC_PRESENT | SPINNING);
+  status |= CHECK_ERROR;
+  critical_section_exit(&statusLock);
+  errorCode = DISC_REMOVED;
+  sleep_ms(10);
+  while (!pio_sm_is_rx_fifo_empty(pio0, sm_read)) {
+    pio_sm_get(pio0, sm_read);
+  }
+  runOnCore0(mediaChangeJob, NULL);
   gpio_put(CDMDCHG, 1); //Under reset
-  // pio_sm_set_enabled(pio0, sm_read, false);
-  // errorCode |= POWER_OR_RESET_OCCURED;
+}
+
+static const track_s* findTrack(uint8_t id) {
+  for (int i = 0; i < currentImage.nb_track; i++) {
+    if (currentImage.tracks[i].id == id) return &currentImage.tracks[i];
+  }
+  return NULL;
 }
 
 void handleCommand(uint32_t data) {
   CD_request_t request = (CD_request_t) GET_BUS(data);
-  bool isCmd = (data>>CDCMD)&0x1 == 0x0;
-  uint32_t data_in[6];
-  uint8_t buffer[18];
+  unsigned int data_in[6] = {0};
+  uint8_t buffer[20];
   uint8_t subBuffer[16];
   uint index = 0;
 
   gpio_put(LED, ledState);
   ledState = !ledState;
 
+  // Every command is 7 bytes long: always consume the 6 parameters, even
+  // when the command is not answered, so they are not taken as commands.
+  if (!get3doParams(data_in)) return;
+
   switch(request) {
     case READ_ID:
-    for (int i=0; i<6; i++) {
-      data_in[i] = get3doData();
-    }
-
-    LOG_SATA("READ ID %x\n", status);
+      LOG_SATA("READ ID %x\n", status);
       if (errorOnDisk != 0) errorOnDisk++;
       buffer[index++] = READ_ID;
       buffer[index++] =0x00; //manufacture Id
@@ -744,9 +893,6 @@ void handleCommand(uint32_t data) {
       sendAnswer(buffer, index, CHAN_WRITE_STATUS);
       break;
     case EJECT_DISC:
-      for (int i=0; i<6; i++) {
-        data_in[i] = get3doData();
-      }
       LOG_SATA("EJECT\n");
       canHandleReset = true;
       close_tray(false);
@@ -754,18 +900,12 @@ void handleCommand(uint32_t data) {
       sendAnswer(buffer, index, CHAN_WRITE_STATUS);
       break;
     case INJECT_DISC:
-        for (int i=0; i<6; i++) {
-          data_in[i] = get3doData();
-        }
-        LOG_SATA("INJECT\n");
-        close_tray(true);
-        buffer[index++] = status;
-        sendAnswer(buffer, index, CHAN_WRITE_STATUS);
-        break;
+      LOG_SATA("INJECT\n");
+      close_tray(true);
+      buffer[index++] = status;
+      sendAnswer(buffer, index, CHAN_WRITE_STATUS);
+      break;
     case READ_ERROR:
-      for (int i=0; i<6; i++) {
-        data_in[i] = get3doData();
-      }
       LOG_SATA("READ ERROR %x %x\n", errorCode, status);
       buffer[index++] = READ_ERROR;
       buffer[index++] = 0x00;
@@ -776,15 +916,12 @@ void handleCommand(uint32_t data) {
       buffer[index++] = 0x00;
       buffer[index++] = 0x00;
       buffer[index++] = 0x00;
-      status &= ~CHECK_ERROR;
+      statusClear(CHECK_ERROR);
       errorCode = NO_ERROR;
       buffer[index++] = status;
       sendAnswer(buffer, index, CHAN_WRITE_STATUS);
       break;
     case DATA_PATH_CHECK:
-      for (int i=0; i<6; i++) {
-        data_in[i] = get3doData();
-      }
       LOG_SATA("DATA_PATH_CHECK %d\n", (status & DISC_PRESENT));
       buffer[index++] = DATA_PATH_CHECK;
       if (!(status & DISC_PRESENT)) {
@@ -800,20 +937,17 @@ void handleCommand(uint32_t data) {
       break;
     case SPIN_UP:
       if (status & DISC_PRESENT) {
-        for (int i=0; i<6; i++) {
-          data_in[i] = get3doData();
-        }
         LOG_SATA("SPIN UP\n");
         buffer[index++] = SPIN_UP;
         if (!(status & TRAY_IN)) {
-            status |= CHECK_ERROR;
-            errorCode |= ILLEGAL_CMD;
+            statusSet(CHECK_ERROR);
+            errorCode = ILLEGAL_CMD;
         } else {
           if (!(status & DISC_RDY)) {
-            status |= CHECK_ERROR;
+            statusSet(CHECK_ERROR);
             errorCode = DISC_REMOVED;
           } else {
-            status |= SPINNING;
+            statusSet(SPINNING);
           }
         }
         buffer[index++] = status;
@@ -822,34 +956,26 @@ void handleCommand(uint32_t data) {
       break;
     case READ_DATA:
       if (status & DISC_PRESENT) {
-        for (int i=0; i<6; i++) {
-          data_in[i] = GET_BUS(get3doData());
-        }
-        LOG_SATA("READ DATA MSF %d:%d:%d %x\n", data_in[0], data_in[1], data_in[2], status);
+        LOG_SATA("READ DATA %d:%d:%d %x %x\n", data_in[0], data_in[1], data_in[2], data_in[3], status);
+        int lba;
         if (data_in[3] == 0x00) {
           //MSF
-          int lba = data_in[0]*60*75+data_in[1]*75+data_in[2] - 150;
-          int nb_block = (data_in[4]<<8)|data_in[5];
-          sendData(lba, nb_block, false);
+          lba = data_in[0]*60*75+data_in[1]*75+data_in[2] - 150;
         } else {
-          //LBA not supported yet
-          LOG_SATA("LBA not supported yet\n");
+          //LBA
+          lba = (data_in[0]<<16)|(data_in[1]<<8)|data_in[2];
         }
+        int nb_block = (data_in[4]<<8)|data_in[5];
+        sendData(lba, nb_block, false);
       }
       break;
     case ABORT:
-      for (int i=0; i<6; i++) {
-        data_in[i] = get3doData();
-      }
       LOG_SATA("ABORT\n");
       buffer[index++] = ABORT;
       buffer[index++] = status;
       sendAnswer(buffer, index, CHAN_WRITE_STATUS);
       break;
     case FLUSH:
-        for (int i=0; i<6; i++) {
-          data_in[i] = get3doData();
-        }
         LOG_SATA("FLUSH\n");
         buffer[index++] = FLUSH;
         buffer[index++] = status;
@@ -857,29 +983,15 @@ void handleCommand(uint32_t data) {
         break;
     case READ_DISC_INFO:
       if (status & DISC_PRESENT) {
-        for (int i=0; i<6; i++) {
-          data_in[i] = get3doData();
-        }
         LOG_SATA("DISC_INFO\n");
         buffer[index++] = READ_DISC_INFO;
         // LBA = (((M*60)+S)*75+F)-150
-        if (status & DISC_PRESENT) {
-          buffer[index++] = currentImage.format;
-          buffer[index++] = currentImage.first_track;
-          buffer[index++] = currentImage.last_track;
-          buffer[index++] = currentImage.msf[0];
-          buffer[index++] = currentImage.msf[1];
-          buffer[index++] = currentImage.msf[2];
-
-        } else {
-          errorCode = NOT_READY;
-          buffer[index++] = 0x0;
-          buffer[index++] = 0x0;
-          buffer[index++] = 0x0;
-          buffer[index++] = 0x0;
-          buffer[index++] = 0x0;
-          buffer[index++] = 0x0;
-        }
+        buffer[index++] = currentImage.format;
+        buffer[index++] = currentImage.first_track;
+        buffer[index++] = currentImage.last_track;
+        buffer[index++] = currentImage.msf[0];
+        buffer[index++] = currentImage.msf[1];
+        buffer[index++] = currentImage.msf[2];
         buffer[index++] = status;
         sendAnswer(buffer, index, CHAN_WRITE_STATUS);
         LOG_SATA("%d %x %d %d %d:%d:%d\n", (status & DISC_PRESENT), buffer[1], buffer[2],buffer[3],buffer[4],buffer[5],buffer[6]);
@@ -887,18 +999,31 @@ void handleCommand(uint32_t data) {
       break;
     case READ_TOC:
       if (status & DISC_PRESENT) {
-        for (int i=0; i<6; i++) {
-          data_in[i] = GET_BUS(get3doData());
-        }
         LOG_SATA("READ_TOC %x\n", data_in[1]);
+        uint8_t ctrl_adr = 0;
+        uint8_t id = 0;
+        uint8_t msf[3] = {0};
+        const track_s *t = findTrack(data_in[1]);
+        if (t != NULL) {
+          ctrl_adr = t->CTRL_ADR;
+          id = t->id;
+          memcpy(msf, t->msf, 3);
+        } else if ((data_in[1] == 0xAA) && (currentImage.nb_track > 0)) {
+          // Lead-out
+          ctrl_adr = currentImage.tracks[currentImage.nb_track - 1].CTRL_ADR;
+          id = 0xAA;
+          memcpy(msf, currentImage.msf, 3);
+        } else {
+          LOG_SATA("Unknown track %x\n", data_in[1]);
+        }
         buffer[index++] = READ_TOC;
         buffer[index++] = 0x0; //NixByte?
-        buffer[index++] = currentImage.tracks[data_in[1]-1].CTRL_ADR; //ADDR
-        buffer[index++] = currentImage.tracks[data_in[1]-1].id; //ENT_NUMBER
+        buffer[index++] = ctrl_adr; //ADDR
+        buffer[index++] = id; //ENT_NUMBER
         buffer[index++] = 0x0;//Format
-        buffer[index++] = currentImage.tracks[data_in[1]-1].msf[0];
-        buffer[index++] = currentImage.tracks[data_in[1]-1].msf[1];
-        buffer[index++] = currentImage.tracks[data_in[1]-1].msf[2];
+        buffer[index++] = msf[0];
+        buffer[index++] = msf[1];
+        buffer[index++] = msf[2];
         buffer[index++] = 0x0;
         buffer[index++] = status;
         sendAnswer(buffer, index, CHAN_WRITE_STATUS);
@@ -907,9 +1032,6 @@ void handleCommand(uint32_t data) {
       break;
     case READ_SESSION:
       if (status & DISC_PRESENT) {
-        for (int i=0; i<6; i++) {
-          data_in[i] = get3doData();
-        }
         LOG_SATA("READ_SESSION\n");
         buffer[index++] = READ_SESSION;
         if (currentImage.multiSession) {
@@ -935,9 +1057,6 @@ void handleCommand(uint32_t data) {
     break;
     case READ_CAPACITY:
       if (status & DISC_PRESENT) {
-        for (int i=0; i<6; i++) {
-          data_in[i] = get3doData();
-        }
         LOG_SATA("READ_CAPACITY\n");
         buffer[index++] = READ_CAPACITY;
         buffer[index++] = currentImage.msf[0];
@@ -950,9 +1069,6 @@ void handleCommand(uint32_t data) {
       }
       break;
       case SET_MODE:
-        for (int i=0; i<6; i++) {
-          data_in[i] = GET_BUS(get3doData());
-        }
         LOG_SATA("SET_MODE %x %x %x %x %x %x\n", data_in[0], data_in[1], data_in[2], data_in[3], data_in[4], data_in[5]);
         /*
         not entirely full
@@ -970,7 +1086,7 @@ where :
 1 = error recovery
 [18:04]
 2 = stop time
-[18:05]
+[18:04]
 3 = speed+pitch
 [18:05]
 4 = chunk size
@@ -1001,9 +1117,9 @@ what's your reply to 0x83?
 
         if (data_in[0] == 0x3) {
           if (data_in[1] & (0x80)) {
-            status |= DOUBLE_SPEED;
+            statusSet(DOUBLE_SPEED);
           } else {
-            status &= ~DOUBLE_SPEED;
+            statusClear(DOUBLE_SPEED);
           }
 
           if (data_in[2] & 0x4) {
@@ -1015,15 +1131,23 @@ what's your reply to 0x83?
           }
         }
         if (data_in[0] == 0x0) {
-          currentImage.block_size_read = (data_in[2]<<8)|(data_in[3]);
+          uint32_t size = (data_in[2]<<8)|(data_in[3]);
           if ((data_in[4] & 0xC0) == 0x80) {
-            currentImage.block_size_read = 2353; //CDDA + error correction
+            size = 2353; //CDDA + error correction
           }
           if ((data_in[4] & 0xC0) == 0x40) {
-            currentImage.block_size_read = 2448; //CDDA+subcode
+            size = 2448; //CDDA+subcode
           }
           if ((data_in[4] & 0xC0) == 0xC0) {
-            currentImage.block_size_read = 2449; //CDDA+subcode+error correction
+            size = 2449; //CDDA+subcode+error correction
+          }
+          if ((size == 0) || (size > sizeof(dataBuffer))) {
+            // Would not fit in the sector buffer
+            LOG_SATA("Unsupported block size %u\n", (unsigned int)size);
+            statusSet(CHECK_ERROR);
+            errorCode = ILLEGAL_MODE;
+          } else {
+            currentImage.block_size_read = size;
           }
           LOG_SATA("Block size to %d\n",currentImage.block_size_read );
         }
@@ -1033,13 +1157,15 @@ what's your reply to 0x83?
         break;
     case READ_SUB_Q:
     if (status & DISC_PRESENT) {
-        for (int i=0; i<6; i++) {
-          data_in[i] = GET_BUS(get3doData());
-        }
         LOG_SATA("READ_SUB_Q\n");
         buffer[index++] = READ_SUB_Q;
+        memset(subBuffer, 0, sizeof(subBuffer));
+        readError = false;
         readSubQChannel(&subBuffer[0]);
-        while(!block_is_ready());
+        if (!waitForBlock()) {
+          if (inReset()) return;
+          memset(subBuffer, 0, sizeof(subBuffer));
+        }
 
         buffer[index++] = subBuffer[5]; //Ctrl/adr
         buffer[index++] = subBuffer[6]; //trk
@@ -1057,9 +1183,6 @@ what's your reply to 0x83?
         break;
 //FIXEL Extended commands implementation for ODE menu
     case EXT_ID:
-      for (int i=0; i<6; i++) {
-        data_in[i] = GET_BUS(get3doData());
-      }
       LOG_SATA("EXT_ID\n");
       buffer[index++] = EXT_ID;
       buffer[index++] = 0x1; //Where is located the boot.iso microsd=1, usbmsc=2, flash=4, sata=8
@@ -1076,31 +1199,25 @@ what's your reply to 0x83?
       sendAnswer(buffer, index, CHAN_WRITE_STATUS);
       break;
     case CHANGE_TOC:
-      for (int i=0; i<6; i++) {
-        data_in[i] = GET_BUS(get3doData());
-      }
       buffer[index++] = CHANGE_TOC;
       {
-        uint32_t entry = 0;
-        entry = ((data_in[0]&0xFF)<<24)|((data_in[1]&0xFF)<<16)|((data_in[2]&0xFF)<<8)|((data_in[3]&0xFF)<<0);
-        LOG_SATA("CHANGE_TOC %d on %d\n", entry&0xFFFFFF, entry>>24);
-        handleTocChange(entry);
+        toc_job_t job = {0};
+        job.index = (int)(((data_in[0]&0xFF)<<24)|((data_in[1]&0xFF)<<16)|((data_in[2]&0xFF)<<8)|((data_in[3]&0xFF)<<0));
+        LOG_SATA("CHANGE_TOC %d on %u\n", job.index&0xFFFFFF, ((unsigned int)job.index)>>24);
+        runOnCore0(setTocLevelJob, &job);
       }
       buffer[index++] = status;
       sendAnswer(buffer, index, CHAN_WRITE_STATUS);
       break;
     case GET_TOC:
-      for (int i=0; i<6; i++) {
-        data_in[i] = GET_BUS(get3doData());
-      }
       buffer[index++] = GET_TOC;
       {
-        uint32_t entry = 0;
-        uint16_t offset = 0;
-        entry = ((data_in[0]&0xFF)<<24)|((data_in[1]&0xFF)<<16)|((data_in[2]&0xFF)<<8)|((data_in[3]&0xFF)<<0);
-        offset = ((data_in[4]&0xFF)<<8)|((data_in[5]&0xFF)<<0);
-        LOG_SATA("GET_TOC %d %d\n", entry, offset);
-        getToc(entry, offset, &buffer[index]);
+        toc_job_t job = {0};
+        job.index = (int)(((data_in[0]&0xFF)<<24)|((data_in[1]&0xFF)<<16)|((data_in[2]&0xFF)<<8)|((data_in[3]&0xFF)<<0));
+        job.offset = ((data_in[4]&0xFF)<<8)|((data_in[5]&0xFF)<<0);
+        job.buffer = &buffer[index];
+        LOG_SATA("GET_TOC %d %d\n", job.index, job.offset);
+        runOnCore0(getTocJob, &job);
         for (int i=0; i<16; i++) LOG_SATA("%x ", buffer[index+i]);
         LOG_SATA("\n");
         index += 16;
@@ -1109,84 +1226,66 @@ what's your reply to 0x83?
       sendAnswer(buffer, index, CHAN_WRITE_STATUS);
       break;
     case GET_DESC:
-      for (int i=0; i<6; i++) {
-        data_in[i] = GET_BUS(get3doData());
-      }
       LOG_SATA("GET_DESC\n");
       buffer[index++] = GET_DESC;
       buffer[index++] = status;
+      sendAnswer(buffer, index, CHAN_WRITE_STATUS);
       break;
     case CLEAR_PLAYLIST:
-      for (int i=0; i<6; i++) {
-        data_in[i] = GET_BUS(get3doData());
-      }
       LOG_SATA("CLEAR_PLAYLIST\n");
       buffer[index++] = CLEAR_PLAYLIST;
       buffer[index++] = status;
-      clearPlaylist();
+      runOnCore0(clearPlaylistJob, NULL);
       sendAnswer(buffer, index, CHAN_WRITE_STATUS);
       break;
     case ADD_PLAYLIST:
-      for (int i=0; i<6; i++) {
-        data_in[i] = GET_BUS(get3doData());
-      }
       buffer[index++] = ADD_PLAYLIST;
       {
-        uint32_t entry = 0;
-        bool valid = false;
-        bool added = false;
-        entry = ((data_in[0]&0xFF)<<24)|((data_in[1]&0xFF)<<16)|((data_in[2]&0xFF)<<8)|((data_in[3]&0xFF)<<0);
-        LOG_SATA("ADD_PLAYLIST %d\n", entry);
-        addToPlaylist(entry, &valid, &added);
-        buffer[index++] = valid;
-        buffer[index++] = added;
+        toc_job_t job = {0};
+        job.entry = (int)(((data_in[0]&0xFF)<<24)|((data_in[1]&0xFF)<<16)|((data_in[2]&0xFF)<<8)|((data_in[3]&0xFF)<<0));
+        LOG_SATA("ADD_PLAYLIST %d\n", job.entry);
+        runOnCore0(addToPlaylistJob, &job);
+        buffer[index++] = job.valid;
+        buffer[index++] = job.added;
       }
       buffer[index++] = status;
       sendAnswer(buffer, index, CHAN_WRITE_STATUS);
       break;
     case LAUNCH_PLAYLIST:
-      for (int i=0; i<6; i++) {
-        data_in[i] = GET_BUS(get3doData());
-      }
       LOG_SATA("LAUNCH_PLAYLIST\n");
       //Initiate an media change error
-      status |= CHECK_ERROR;
+      statusSet(CHECK_ERROR);
       buffer[index++] = LAUNCH_PLAYLIST;
       buffer[index++] = status;
       sendAnswer(buffer, index, CHAN_WRITE_STATUS);
       mediaInterrupt();
       break;
     case GET_TOC_LIST:
-      for (int i=0; i<6; i++) {
-        data_in[i] = GET_BUS(get3doData());
-      }
-      buffer[index++] = GET_TOC_LIST;
       {
-        uint32_t entry = 0;
-        uint16_t offset = 0;
-        entry = ((data_in[0]&0xFF)<<24)|((data_in[1]&0xFF)<<16)|((data_in[2]&0xFF)<<8)|((data_in[3]&0xFF)<<0);
-        offset = ((data_in[4]&0xFF)<<8)|((data_in[5]&0xFF)<<0);
-        LOG_SATA("GET_TOC_LIST %d %d\n", entry, offset);
-        getTocFull(entry, offset);
+        toc_job_t job = {0};
+        job.index = (int)(((data_in[0]&0xFF)<<24)|((data_in[1]&0xFF)<<16)|((data_in[2]&0xFF)<<8)|((data_in[3]&0xFF)<<0));
+        job.offset = ((data_in[4]&0xFF)<<8)|((data_in[5]&0xFF)<<0);
+        LOG_SATA("GET_TOC_LIST %d %d\n", job.index, job.offset);
+        runOnCore0(getTocFullJob, &job);
       }
       sendRawData(GET_TOC_LIST, &TOC[0], 2048);
+#ifdef USE_TRACE
       LOG_SATA("TOC Buffer:\n");
-      for (int i=0; i<2048;) {
-        uint32_t flags = (TOC[i++]<<24)|(TOC[i++]<<16)|(TOC[i++]<<8)|(TOC[i++]<<0);
-        if (flags != TOC_FLAG_INVALID) {
-          uint32_t toc_id = (TOC[i++]<<24)|(TOC[i++]<<16)|(TOC[i++]<<8)|(TOC[i++]<<0);
-          uint32_t name_length = (TOC[i++]<<24)|(TOC[i++]<<16)|(TOC[i++]<<8)|(TOC[i++]<<0);
-          LOG_SATA(".flags :0x%x, .toc_id: %d %d, .name_length: %d, .name: %s\n", flags, toc_id>>24, getTocEntry(toc_id), name_length, &TOC[i]);
-          i += name_length;
-        } else break;
+      for (size_t i=0; i + 12 <= sizeof(TOC);) {
+        uint32_t flags = read32(&TOC[i]);
+        if (flags == TOC_FLAG_INVALID) break;
+        uint32_t toc_id = read32(&TOC[i+4]);
+        uint32_t name_length = read32(&TOC[i+8]);
+        i += 12;
+        if (name_length > sizeof(TOC) - i) break;
+        LOG_SATA(".flags :0x%lx, .toc_id: %lu %d, .name_length: %lu, .name: %.*s\n", flags, toc_id>>24, getTocEntry(toc_id), name_length, (int)name_length, &TOC[i]);
+        i += name_length;
       }
       LOG_SATA("\n");
+#endif
       break;
     //Not supported yet
     case CREATE_FILE:
-      for (int i=0; i<6; i++) {
-        data_in[i] = GET_BUS(get3doData());
-      }
       LOG_SATA("CREATE_FILE\n");
       buffer[index++] = CREATE_FILE;
       buffer[index++] = 0; //Always report a failure
@@ -1194,89 +1293,71 @@ what's your reply to 0x83?
       sendAnswer(buffer, index, CHAN_WRITE_STATUS);
       break;
     case OPEN_FILE:
-      for (int i=0; i<6; i++) {
-        data_in[i] = GET_BUS(get3doData());
-      }
       {
-        bool write = (data_in[5]!=0);
-        bool success = false;
+        file_job_t job = {0};
+        job.write = (data_in[5]!=0);
         if ((data_in[0]&0xFF) != 0) {
-          uint32_t toc_id = ((data_in[1]&0xFF)<<24)|((data_in[2]&0xFF)<<16)|((data_in[3]&0xFF)<<8)|((data_in[4]&0xFF)<<0);
-          LOG_SATA("OPEN_FILE TOC_ID %x, W/R %d\n", toc_id, write);
+          unsigned int toc_id = ((data_in[1]&0xFF)<<24)|((data_in[2]&0xFF)<<16)|((data_in[3]&0xFF)<<8)|((data_in[4]&0xFF)<<0);
+          LOG_SATA("OPEN_FILE TOC_ID %x, W/R %d (not supported)\n", toc_id, job.write);
         } else {
           uint16_t name_length = ((data_in[1]&0xFF)<<8)|((data_in[2]&0xFF)<<0);
-          LOG_SATA("OPEN_FILE NAME %d %s, W/R %d\n", name_length, &FILE_BUFFER[0], write);
-          requestOpenFile(&FILE_BUFFER[0], name_length, write);
-          while (!cmd_is_ready(&success));
+          if (name_length > sizeof(FILE_BUFFER)) name_length = sizeof(FILE_BUFFER);
+          LOG_SATA("OPEN_FILE NAME %d %.*s, W/R %d\n", name_length, name_length, &FILE_BUFFER[0], job.write);
+          job.name = (const char *)&FILE_BUFFER[0];
+          job.length = name_length;
+          runOnCore0(openFileJob, &job);
         }
         buffer[index++] = OPEN_FILE;
-        buffer[index++] = success; //Always report a failure
+        buffer[index++] = job.success;
         buffer[index++] = status;
       }
       sendAnswer(buffer, index, CHAN_WRITE_STATUS);
       break;
     case SEEK_FILE:
-      for (int i=0; i<6; i++) {
-        data_in[i] = GET_BUS(get3doData());
-      }
       LOG_SATA("SEEK_FILE\n");
       buffer[index++] = SEEK_FILE;
       buffer[index++] = status;
       sendAnswer(buffer, index, CHAN_WRITE_STATUS);
       break;
     case READ_FILE_BYTE:
-      for (int i=0; i<6; i++) {
-        data_in[i] = GET_BUS(get3doData());
-      }
+    case WRITE_FILE_BYTE:
       {
-        bool success = false;
+        file_job_t job = {0};
         uint16_t length = ((data_in[0]&0xFF)<<8)|((data_in[1]&0xFF)<<0);
-        LOG_SATA("READ_FILE_BYTE %x\n", length);
-        requestReadFile(&FILE_BUFFER[0], length);
-        while (!cmd_is_ready(&success));
-        buffer[index++] = READ_FILE_BYTE;
-        buffer[index++] = success?data_in[0]:0;
-        buffer[index++] = success?data_in[1]:0;
+        // FILE_BUFFER is the only exchange buffer: never go beyond it
+        if (length > sizeof(FILE_BUFFER)) length = sizeof(FILE_BUFFER);
+        LOG_SATA("%s %x\n", (request == READ_FILE_BYTE)?"READ_FILE_BYTE":"WRITE_FILE_BYTE", length);
+        job.buf = &FILE_BUFFER[0];
+        job.length = length;
+        runOnCore0((request == READ_FILE_BYTE) ? readFileJob : writeFileJob, &job);
+        // Report the number of bytes really transferred
+        buffer[index++] = request;
+        buffer[index++] = job.success ? (job.done>>8) : 0;
+        buffer[index++] = job.success ? (job.done&0xFF) : 0;
       }
       buffer[index++] = status;
       sendAnswer(buffer, index, CHAN_WRITE_STATUS);
       break;
-    case WRITE_FILE_BYTE:
-    for (int i=0; i<6; i++) {
-      data_in[i] = GET_BUS(get3doData());
-    }{
-      bool success = false;
-      uint16_t length = ((data_in[0]&0xFF)<<8)|((data_in[1]&0xFF)<<0);
-      LOG_SATA("WRITE_FILE_BYTE %x\n", length);
-      requestWriteFile(&FILE_BUFFER[0], length);
-      while (!cmd_is_ready(&success));
-      buffer[index++] = WRITE_FILE_BYTE;
-      buffer[index++] = success?data_in[0]:0;
-      buffer[index++] = success?data_in[1]:0;
-    }
-    buffer[index++] = status;
-    sendAnswer(buffer, index, CHAN_WRITE_STATUS);
-      break;
     case CLOSE_FILE:
-    for (int i=0; i<6; i++) {
-      data_in[i] = GET_BUS(get3doData());
-    }
-    LOG_SATA("CLOSE_FILE\n");
-    requestCloseFile();
-    while (!cmd_is_ready(NULL));
-    buffer[index++] = CLOSE_FILE;
-    buffer[index++] = status;
-    sendAnswer(buffer, index, CHAN_WRITE_STATUS);
+      {
+        file_job_t job = {0};
+        LOG_SATA("CLOSE_FILE\n");
+        runOnCore0(closeFileJob, &job);
+      }
+      buffer[index++] = CLOSE_FILE;
+      buffer[index++] = status;
+      sendAnswer(buffer, index, CHAN_WRITE_STATUS);
       break;
     case WRITE_BUFFER_OFFSET:
-    for (int i=0; i<6; i++) {
-      data_in[i] = GET_BUS(get3doData());
-    }
     {
-      uint16_t offset = (((data_in[0]&0xFF)<<8)|((data_in[1]&0xFF)<<0))<<2;
+      unsigned int offset = (((data_in[0]&0xFF)<<8)|((data_in[1]&0xFF)<<0))<<2;
       LOG_SATA("WRITE_BUFFER_OFFSET 0x%x\n", offset);
-      for (int i=0; i<4; i++) {
-        FILE_BUFFER[offset+i] = data_in[2+i];
+      if (offset + 4 <= sizeof(FILE_BUFFER)) {
+        for (int i=0; i<4; i++) {
+          FILE_BUFFER[offset+i] = data_in[2+i];
+        }
+      } else {
+        LOG_SATA("Offset out of buffer\n");
       }
     }
     buffer[index++] = WRITE_BUFFER_OFFSET;
@@ -1284,16 +1365,10 @@ what's your reply to 0x83?
     sendAnswer(buffer, index, CHAN_WRITE_STATUS);
       break;
     case READ_BUFFER:
-    for (int i=0; i<6; i++) {
-      data_in[i] = GET_BUS(get3doData());
-    }
     LOG_SATA("READ_BUFFER\n");
     sendRawData(READ_BUFFER, &FILE_BUFFER[0], 2048);
       break;
     case UPDATE_ODE:
-    for (int i=0; i<6; i++) {
-      data_in[i] = GET_BUS(get3doData());
-    }
     LOG_SATA("UPDATE_ODE\n");
     buffer[index++] = UPDATE_ODE;
     buffer[index++] = status;
@@ -1310,7 +1385,7 @@ void setupDMA(uint8_t access) {
   channel_config_set_read_increment(&config[access], true);
   channel_config_set_write_increment(&config[access], false);
   channel_config_set_irq_quiet(&config[access], true);
-  channel_config_set_dreq(&config[access], DREQ_PIO0_TX0 + access);
+  channel_config_set_dreq(&config[access], pio_get_dreq(pio0, sm[access], true));
   dma_channel_set_write_addr(channel[access], &pio0->txf[sm[access]], false);
   dma_channel_set_config(channel[access], &config[access], false);
 
@@ -1331,7 +1406,6 @@ static bool debounceEject = false;
 void core1_entry() {
 
   uint32_t data_in;
-  bool reset_occured = true;
   bool ejectState = gpio_get(EJECT);
 
   lastPacket = nil_time;
@@ -1354,15 +1428,14 @@ void core1_entry() {
     } else {
       if (!gpio_get(CDRST)) {
         LOG_SATA("Got a reset Status!\n");
-        reset_occured = true;
         wait_out_of_reset();
-        status |= CHECK_ERROR;
+        statusSet(CHECK_ERROR);
         errorCode = POWER_OR_RESET_OCCURED;
         restartReadPio();
       }
       if (gpio_get(CDEN)) {
         LOG_SATA("CD is not enabled\n");
-        while(gpio_get(CDEN));
+        while(gpio_get(CDEN) && gpio_get(CDRST));
         LOG_SATA("CD is enabled now\n");
       }
 
@@ -1382,7 +1455,6 @@ void core1_entry() {
         if (debounceEject && (absolute_time_diff_us(s, get_absolute_time()) > 25000)) debounceEject = false;
       }
 
-      reset_occured = false;
       if (is3doData()) {
         data_in = get3doData();
         handleCommand(data_in);
@@ -1395,6 +1467,8 @@ void core1_entry() {
 void _3DO_init() {
   // use_cdrom = true;
   uint offset = -1;
+
+  critical_section_init(&statusLock);
 
   gpio_init(CDRST);
   gpio_set_dir(CDRST, false);
@@ -1454,7 +1528,7 @@ void _3DO_init() {
     instr_jmp_read = pio_encode_jmp(offset);
 
 
-    for (int i = 0; i<32; i++) {
+    for (int i = 0; i<30; i++) {
        gpio_set_drive_strength(i, GPIO_DRIVE_STRENGTH_12MA);
     }
 

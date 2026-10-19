@@ -22,7 +22,13 @@ typedef struct {
   uint8_t msf[3];
   uint32_t lba;
   mode_s mode;
+  uint16_t sector_size; // size of a sector in the image file (2048 or 2352)
+  uint8_t file_idx;     // index of the image file holding this track
+  int32_t file_lba;     // disc LBA matching the first sector of this file
+  int32_t start_lba;    // first LBA of the track: INDEX 00 (pregap) if any, else lba
 } track_s;
+
+#define MAX_TRACKS 99
 
 typedef struct {
   bool multiSession;

@@ -2,6 +2,7 @@
 #define _3DO_INTERFACE_H_
 
 #include <stdbool.h>
+#include <stdio.h>
 #include "tusb.h"
 
 #define UART_LED 28
@@ -73,7 +74,7 @@
 #ifdef USE_TRACE
 #define LOG_SATA printf
 #else
-#define LOG_SATA
+#define LOG_SATA(...) do { if (0) printf(__VA_ARGS__); } while (0)
 #endif
 
 extern void _3DO_init();

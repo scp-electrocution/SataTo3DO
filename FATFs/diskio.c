@@ -7,11 +7,14 @@
 #include "ffconf.h"
 #include "diskio.h"
 
-static DSTATUS disk_state[CFG_TUH_DEVICE_MAX];
-	
+/* FatFs physical drive N is the USB device with address N+1 */
+#define DRV_COUNT ((CFG_TUH_DEVICE_MAX < FF_VOLUMES) ? CFG_TUH_DEVICE_MAX : FF_VOLUMES)
+
+static DSTATUS disk_state[DRV_COUNT];
+
 void diskio_init(void)
 {
-	memset(disk_state, STA_NOINIT, CFG_TUH_DEVICE_MAX);
+	memset(disk_state, STA_NOINIT, sizeof(disk_state));
 }
 
 /*-----------------------------------------------------------------------*/
@@ -21,12 +24,14 @@ DSTATUS disk_initialize (
 	BYTE drv				/* Physical drive nmuber (0..) */
 )
 {
+	if (drv >= DRV_COUNT) return STA_NOINIT;
 	disk_state[drv] &= (~STA_NOINIT); // clear NOINIT bit
 	return disk_state[drv];
 }
 
 void disk_deinitialize ( BYTE drv )
 {
+	if (drv >= DRV_COUNT) return;
 	disk_state[drv] |= STA_NOINIT; // set NOINIT bit
 }
 
@@ -37,42 +42,56 @@ DSTATUS disk_status (
 	BYTE drv		/* Physical drive nmuber (0..) */
 )
 {
+	if (drv >= DRV_COUNT) return STA_NOINIT;
 	return disk_state[drv];
 }
 
 /*-----------------------------------------------------------------------*/
 /* Read Sector(s)                                                        */
 
-volatile bool read_flag;
-volatile bool write_flag;
+static volatile bool read_flag;
+static volatile bool read_ok;
+static volatile bool write_flag;
+static volatile bool write_ok;
 
-bool tuh_msc_read10_cb(uint8_t dev_addr, const msc_cbw_t *cbw, const msc_csw_t *csw) {
+static bool disk_read10_cb(uint8_t dev_addr, const msc_cbw_t *cbw, const msc_csw_t *csw) {
+	(void) dev_addr; (void) cbw;
+	read_ok = (csw->status == MSC_CSW_STATUS_GOOD);
 	read_flag = true;
+	return true;
 }
-bool tuh_msc_write10_cb(uint8_t dev_addr, const msc_cbw_t *cbw, const msc_csw_t *csw) {
- 	write_flag = true;
+
+static bool disk_write10_cb(uint8_t dev_addr, const msc_cbw_t *cbw, const msc_csw_t *csw) {
+	(void) dev_addr; (void) cbw;
+	write_ok = (csw->status == MSC_CSW_STATUS_GOOD);
+	write_flag = true;
+	return true;
 }
 
 DRESULT disk_read (
 	BYTE drv,		/* Physical drive nmuber (0..) */
 	BYTE *buff,		/* Data buffer to store read data */
 	DWORD sector,	/* Sector address (LBA) */
-	BYTE count		/* Number of sectors to read (1..255) */
+	UINT count		/* Number of sectors to read */
 )
 {
+	if ((drv >= DRV_COUNT) || (count == 0) || (count > 0xFFFF)) return RES_PARERR;
 	uint8_t usb_addr = drv+1;
 	read_flag = false;
-	if ( !tuh_msc_read10(usb_addr, 0, buff, sector, count, tuh_msc_read10_cb)) {
+	read_ok = false;
+	if ( !tuh_msc_read10(usb_addr, 0, buff, sector, (uint16_t)count, disk_read10_cb)) {
 		return RES_ERROR;
 	}
 	uint64_t time_limit = time_us_64() + TIMEOUT_WAIT_US;
-	while (!read_flag) { 
-		tuh_task(); 
+	while (!read_flag) {
+		tuh_task();
 		if (time_us_64() > time_limit) {
+			/* The transfer can not be cancelled with this USB stack: the device is
+			   most probably gone, report the error to FatFs. */
 			return RES_ERROR;
 		}
 	}
-	return RES_OK;
+	return read_ok ? RES_OK : RES_ERROR;
 }
 
 /*-----------------------------------------------------------------------*/
@@ -83,22 +102,24 @@ DRESULT disk_write (
 	BYTE drv,			/* Physical drive nmuber (0..) */
 	const BYTE *buff,	/* Data to be written */
 	DWORD sector,		/* Sector address (LBA) */
-	BYTE count			/* Number of sectors to write (1..255) */
+	UINT count			/* Number of sectors to write */
 )
 {
+	if ((drv >= DRV_COUNT) || (count == 0) || (count > 0xFFFF)) return RES_PARERR;
 	uint8_t usb_addr = drv+1;
 	write_flag = false;
-	if ( !tuh_msc_write10(usb_addr, 0, buff, sector, count, tuh_msc_write10_cb) ) {
+	write_ok = false;
+	if ( !tuh_msc_write10(usb_addr, 0, buff, sector, (uint16_t)count, disk_write10_cb) ) {
 		return RES_ERROR;
-	}		
+	}
 	uint64_t time_limit = time_us_64() + TIMEOUT_WAIT_US;
-	while (!write_flag) { 
-		tuh_task(); 
+	while (!write_flag) {
+		tuh_task();
 		if (time_us_64() > time_limit) {
 			return RES_ERROR;
 		}
 	}
-	return RES_OK;
+	return write_ok ? RES_OK : RES_ERROR;
 }
 #endif /* _READONLY */
 
@@ -111,6 +132,7 @@ DRESULT disk_ioctl (
 	void *buff		/* Buffer to send/receive control data */
 )
 {
+	(void) drv; (void) buff;
 	if (ctrl == CTRL_SYNC)
 		return RES_OK;
 	else

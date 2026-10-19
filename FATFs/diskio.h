@@ -43,9 +43,9 @@ void diskio_init(void);
 void disk_deinitialize ( BYTE pdrv );
 DSTATUS disk_initialize (BYTE);
 DSTATUS disk_status (BYTE);
-DRESULT disk_read (BYTE, BYTE*, DWORD, BYTE);
+DRESULT disk_read (BYTE, BYTE*, DWORD, UINT);
 #if	_READONLY == 0
-DRESULT disk_write (BYTE, const BYTE*, DWORD, BYTE);
+DRESULT disk_write (BYTE, const BYTE*, DWORD, UINT);
 #endif
 DRESULT disk_ioctl (BYTE, BYTE, void*);
 

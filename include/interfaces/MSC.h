@@ -4,13 +4,11 @@
 #include "USB.h"
 #include "TOC.h"
 
-extern char *curPath;
+extern bool onBootIso;
 
 extern bool MSC_Host_loop(device_s *dev);
 
 extern bool MSC_Inquiry(uint8_t dev_addr, uint8_t lun);
-
-extern bool MSC_ExecuteEject(bool eject);
 
 extern void setTocLevel(int index);
 extern int getTocLevel(void);
@@ -30,16 +28,19 @@ extern void addToPlaylist(int entry, bool *valid, bool *added);
 
 extern bool seekTocTo(int index);
 
-extern void requestOpenFile(char* name, uint16_t name_length, bool write);
-extern void requestWriteFile(uint8_t* buf, uint16_t length);
-extern void requestReadFile(uint8_t* buf, uint16_t length);
-extern void requestCloseFile();
+// File services for the ODE menu. They must be executed on core 0.
+extern bool openDataFile(const char* name, uint16_t name_length, bool write);
+extern bool writeDataFile(const uint8_t* buf, uint16_t length, uint16_t *written);
+extern bool readDataFile(uint8_t* buf, uint16_t length, uint16_t *read);
+extern bool closeDataFile(void);
 
-extern void requestBootImage();
-extern void waitForLoad();
+// Load boot.iso or the next playlist entry from this device. Core 0 only.
+extern bool loadBootImage(uint8_t dev_addr);
+
+// Forget the current image (menu context and image files). Core 0 only.
+extern void MSC_releaseCurrentImage(void);
 
 extern int getPlaylistEntries();
 extern void updatePlayListEntries();
-
 
 #endif
