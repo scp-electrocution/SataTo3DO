@@ -32,9 +32,30 @@ cmake ../
 make -j8
 ```
 Per default, the setup is done for waveshare_rp2040_plus_4mb.
-For a 16mb, you need to edit the CMakeLists.txt file and change the PICO_BOARD to waveshare_rp2040_plus_16mb
+The board can be selected from the command line without editing CMakeLists.txt:
+```bash
+cmake ../ -DPICO_BOARD=pico                       # official Raspberry Pi Pico (2 MB)
+cmake ../ -DPICO_BOARD=waveshare_rp2040_plus_16mb  # Waveshare RP2040-Plus 16 MB
+```
+If `PICO_BOARD` is not given, the default (waveshare_rp2040_plus_4mb) is used.
 
 Otherwise, cmake will raise errors that it cannot find the necessary include files.
+
+### Build options
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `USE_DEBUG` | OFF | Enable UART trace output for debugging |
+| `USE_HS_FC` | OFF | Hardware revision with the CTRL3 pin bug (remaps CDHRD) |
+| `USE_DIR_IN_HIGH` | OFF | Data-direction signal is high when reading |
+
+Example: `cmake ../ -DPICO_BOARD=pico -DUSE_DIR_IN_HIGH=ON`
+
+When changing options or the board, use a fresh build directory (or delete
+`CMakeCache.txt`), otherwise the cached values may be kept.
+
+See [CHANGELOG.md](CHANGELOG.md) for the list of changes in this fork and
+[docs/ODE_PROTOCOL.md](docs/ODE_PROTOCOL.md) for the ODE protocol used by the
+on-console menu (`boot.iso`).
 
 ## Setup
 Plug a USB-C usb flash drive key (CDROM support is preliminary, it requires extra power), do not use a SSD (consuming lot of power).
