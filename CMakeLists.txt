@@ -5,7 +5,10 @@ set(FAMILY rp2040)
 set(BOARD pico_sdk)
 set(PICO_TINYUSB_PATH "${CMAKE_CURRENT_SOURCE_DIR}/tinyusb")
 
-set(PICO_BOARD waveshare_rp2040_plus_4mb)
+# Overridable from the command line (-DPICO_BOARD=pico for an official Pi Pico)
+if(NOT DEFINED PICO_BOARD)
+  set(PICO_BOARD waveshare_rp2040_plus_4mb)
+endif()
 
 set(PICO_STACK_SIZE _u(0x1000))
 
